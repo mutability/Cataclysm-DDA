@@ -67,10 +67,13 @@ static const std::string TILE_CATEGORY_IDS[] = {
 };
 
 // Operator overload required to leverage unique_ptr API.
-void SDL_Texture_deleter::operator()( SDL_Texture *const ptr )
+void GPU_Image_deleter::operator()( GPU_Image *const ptr )
 {
     if( ptr ) {
-        SDL_DestroyTexture( ptr );
+        if( ptr->target ) {
+            GPU_FreeTarget( ptr->target );
+        }
+        GPU_FreeImage( ptr );
     }
 }
 
@@ -82,10 +85,10 @@ void SDL_Surface_deleter::operator()( SDL_Surface *const ptr )
     }
 }
 
-cata_tiles::cata_tiles(SDL_Renderer *render)
+cata_tiles::cata_tiles(GPU_Target *target)
 {
     //ctor
-    renderer = render;
+    render_target = target;
 
     tile_height = 0;
     tile_width = 0;
@@ -118,10 +121,8 @@ cata_tiles::~cata_tiles()
 void cata_tiles::clear()
 {
     // release maps
-    tile_values.clear();
-    shadow_tile_values.clear();
-    night_tile_values.clear();
-    overexposed_tile_values.clear();
+    tile_atlases.clear();
+    tile_bounds.clear();
     tile_ids.clear();
     // release minimap
     minimap_cache.clear();
@@ -306,40 +307,55 @@ static void apply_color_filter(SDL_Surface_Ptr &surf, void (&pixel_converter)(pi
 int cata_tiles::load_tileset(std::string img_path, int R, int G, int B, int sprite_width, int sprite_height)
 {
     /** reinit tile_atlas */
-    SDL_Surface_Ptr tile_atlas( IMG_Load( img_path.c_str() ) );
+    SDL_Surface_Ptr tile_atlas_surf( IMG_Load( img_path.c_str() ) );
 
-    if(!tile_atlas) {
+    if(!tile_atlas_surf) {
         throw std::runtime_error( std::string("Could not load tileset image at ") + img_path + ", error: " +
                                   IMG_GetError() );
     }
 
-    SDL_Surface_Ptr shadow_tile_atlas = create_tile_surface(tile_atlas->w, tile_atlas->h);
-    SDL_Surface_Ptr nightvision_tile_atlas = create_tile_surface(tile_atlas->w, tile_atlas->h);
-    SDL_Surface_Ptr overexposed_tile_atlas = create_tile_surface(tile_atlas->w, tile_atlas->h);
+    SDL_Surface_Ptr shadow_tile_atlas_surf = create_tile_surface(tile_atlas_surf->w, tile_atlas_surf->h);
+    SDL_Surface_Ptr nightvision_tile_atlas_surf = create_tile_surface(tile_atlas_surf->w, tile_atlas_surf->h);
+    SDL_Surface_Ptr overexposed_tile_atlas_surf = create_tile_surface(tile_atlas_surf->w, tile_atlas_surf->h);
 
-    if(!shadow_tile_atlas || !nightvision_tile_atlas || !overexposed_tile_atlas) {
+    if(!shadow_tile_atlas_surf || !nightvision_tile_atlas_surf || !overexposed_tile_atlas_surf) {
         throw std::runtime_error( std::string("Unable to create alternate colored tilesets.") );
     }
 
+    if( R >= 0 && R <= 255 && G >= 0 && G <= 255 && B >= 0 && B <= 255 ) {
+        Uint32 key = SDL_MapRGB(tile_atlas_surf->format, R, G, B);
+        SDL_SetColorKey(tile_atlas_surf.get(), SDL_TRUE, key);
+    }
+    
     /** copy tile atlas into alternate atlas sets */
-    if( SDL_BlitSurface( tile_atlas.get(), NULL, shadow_tile_atlas.get(), NULL ) != 0 ) {
+    if( SDL_BlitSurface( tile_atlas_surf.get(), NULL, shadow_tile_atlas_surf.get(), NULL ) != 0 ) {
         dbg( D_ERROR ) << "SDL_BlitSurface failed: " << SDL_GetError();
     }
-    if( SDL_BlitSurface( tile_atlas.get(), NULL, nightvision_tile_atlas.get(), NULL ) != 0 ) {
+    if( SDL_BlitSurface( tile_atlas_surf.get(), NULL, nightvision_tile_atlas_surf.get(), NULL ) != 0 ) {
         dbg( D_ERROR ) << "SDL_BlitSurface failed: " << SDL_GetError();
     }
-    if( SDL_BlitSurface( tile_atlas.get(), NULL, overexposed_tile_atlas.get(), NULL ) != 0 ) {
+    if( SDL_BlitSurface( tile_atlas_surf.get(), NULL, overexposed_tile_atlas_surf.get(), NULL ) != 0 ) {
         dbg( D_ERROR ) << "SDL_BlitSurface failed: " << SDL_GetError();
     }
 
     /** perform color filter conversion here */
-    apply_color_filter(shadow_tile_atlas, color_pixel_grayscale);
-    apply_color_filter(nightvision_tile_atlas, color_pixel_nightvision);
-    apply_color_filter(overexposed_tile_atlas, color_pixel_overexposed);
+    apply_color_filter(shadow_tile_atlas_surf, color_pixel_grayscale);
+    apply_color_filter(nightvision_tile_atlas_surf, color_pixel_nightvision);
+    apply_color_filter(overexposed_tile_atlas_surf, color_pixel_overexposed);
+
+    GPU_Image_Ptr tile_atlas(GPU_CopyImageFromSurface(tile_atlas_surf.get()));
+    GPU_Image_Ptr shadow_tile_atlas(GPU_CopyImageFromSurface(shadow_tile_atlas_surf.get()));
+    GPU_Image_Ptr nightvision_tile_atlas(GPU_CopyImageFromSurface(nightvision_tile_atlas_surf.get()));
+    GPU_Image_Ptr overexposed_tile_atlas(GPU_CopyImageFromSurface(overexposed_tile_atlas_surf.get()));
+
+    GPU_SetImageFilter(tile_atlas.get(), GPU_FILTER_NEAREST);
+    GPU_SetImageFilter(shadow_tile_atlas.get(), GPU_FILTER_NEAREST);
+    GPU_SetImageFilter(nightvision_tile_atlas.get(), GPU_FILTER_NEAREST);
+    GPU_SetImageFilter(overexposed_tile_atlas.get(), GPU_FILTER_NEAREST);
 
     /** get dimensions of the atlas image */
-    int w = tile_atlas->w;
-    int h = tile_atlas->h;
+    int w = tile_atlas_surf->w;
+    int h = tile_atlas_surf->h;
     /** sx and sy will take care of any extraneous pixels that do not add up to a full tile */
     int sx = w / sprite_width;
     int sy = h / sprite_height;
@@ -348,82 +364,33 @@ int cata_tiles::load_tileset(std::string img_path, int R, int G, int B, int spri
     sy *= sprite_height;
 
     /** Set up initial source and destination information. Destination is going to be unchanging */
-    SDL_Rect source_rect = {0, 0, sprite_width, sprite_height};
-    SDL_Rect dest_rect = {0, 0, sprite_width, sprite_height};
+    GPU_Rect source_rect = {0, 0, (float)sprite_width, (float)sprite_height};
 
-    /** split the atlas into tiles using SDL_Rect structs instead of slicing the atlas into individual surfaces */
+    /** split the atlas into tiles using GPU_Rect structs instead of slicing the atlas into individual surfaces */
     int tilecount = 0;
     for( int y = 0; y < sy; y += sprite_height ) {
         for( int x = 0; x < sx; x += sprite_width ) {
             source_rect.x = x;
             source_rect.y = y;
 
-            SDL_Surface_Ptr tile_surf = create_tile_surface(sprite_width, sprite_height);
-            if( !tile_surf ) {
-                continue;
-            }
-
-            if( SDL_BlitSurface( tile_atlas.get(), &source_rect, tile_surf.get(), &dest_rect ) != 0 ) {
-                dbg( D_ERROR ) << "SDL_BlitSurface failed: " << SDL_GetError();
-            }
-
-            if( R >= 0 && R <= 255 && G >= 0 && G <= 255 && B >= 0 && B <= 255 ) {
-                Uint32 key = SDL_MapRGB(tile_surf->format, 0, 0, 0);
-                SDL_SetColorKey(tile_surf.get(), SDL_TRUE, key);
-                SDL_SetSurfaceRLE(tile_surf.get(), true);
-            }
-
-            SDL_Texture_Ptr tile_tex( SDL_CreateTextureFromSurface( renderer, tile_surf.get() ) );
-
-            if( !tile_tex ) {
-                dbg( D_ERROR) << "failed to create texture: " << SDL_GetError();
-            }
-
-            /** reuse the surface to make alternate color filtered versions */
-            if( SDL_BlitSurface( shadow_tile_atlas.get(), &source_rect, tile_surf.get(), &dest_rect ) != 0 ) {
-                dbg( D_ERROR ) << "SDL_BlitSurface failed: " << SDL_GetError();
-            }
-
-            SDL_Texture_Ptr shadow_tile_tex( SDL_CreateTextureFromSurface( renderer, tile_surf.get() ) );
-            if( !shadow_tile_tex ) {
-                dbg( D_ERROR) << "failed to create texture: " << SDL_GetError();
-            }
-
-            if( SDL_BlitSurface( nightvision_tile_atlas.get(), &source_rect, tile_surf.get(), &dest_rect ) != 0 ) {
-                dbg( D_ERROR ) << "SDL_BlitSurface failed: " << SDL_GetError();
-            }
-
-            SDL_Texture_Ptr night_tile_tex( SDL_CreateTextureFromSurface( renderer, tile_surf.get() ) );
-            if( !night_tile_tex ) {
-                dbg( D_ERROR) << "failed to create texture: " << SDL_GetError();
-            }
-
-            if( SDL_BlitSurface( overexposed_tile_atlas.get(), &source_rect, tile_surf.get(), &dest_rect ) != 0 ) {
-                dbg( D_ERROR ) << "SDL_BlitSurface failed: " << SDL_GetError();
-            }
-
-            SDL_Texture_Ptr overexposed_tile_tex( SDL_CreateTextureFromSurface( renderer, tile_surf.get() ) );
-            if( overexposed_tile_tex == nullptr ) {
-                dbg( D_ERROR) << "failed to create texture: " << SDL_GetError();
-            }
-
-            if( tile_tex ) {
-                tile_values.push_back( std::move( tile_tex ) );
-                tilecount++;
-            }
-            if( shadow_tile_tex ) {
-                shadow_tile_values.push_back( std::move( shadow_tile_tex ) );
-            }
-            if( night_tile_tex ) {
-                night_tile_values.push_back( std::move( night_tile_tex ) );
-            }
-            if( overexposed_tile_tex ) {
-                overexposed_tile_values.push_back( std::move( overexposed_tile_tex ) );
-            }
+            tile_bound bound;
+            bound.bounds = source_rect;
+            bound.normal = tile_atlas.get();
+            bound.shadow = shadow_tile_atlas.get();
+            bound.overexposed = overexposed_tile_atlas.get();
+            bound.nightvision = nightvision_tile_atlas.get();
+            tile_bounds.push_back( bound );
+            tilecount++;
         }
     }
 
+    tile_atlases.push_back(std::move(tile_atlas));
+    tile_atlases.push_back(std::move(shadow_tile_atlas));
+    tile_atlases.push_back(std::move(overexposed_tile_atlas));
+    tile_atlases.push_back(std::move(nightvision_tile_atlas));
+    
     dbg( D_INFO ) << "Tiles Created: " << tilecount;
+
     return tilecount;
 }
 
@@ -857,15 +824,11 @@ void cata_tiles::draw( int destx, int desty, const tripoint &center, int width, 
         return;
     }
 
-    {
-        //set clipping to prevent drawing over stuff we shouldn't
-        SDL_Rect clipRect = {destx, desty, width, height};
-        SDL_RenderSetClipRect(renderer, &clipRect);
+    //set clipping to prevent drawing over stuff we shouldn't
+    GPU_SetClip(render_target, destx, desty, width, height);
 
-        //fill render area with black to prevent artifacts where no new pixels are drawn
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-        SDL_RenderFillRect(renderer, &clipRect);
-    }
+    //fill render area with black to prevent artifacts where no new pixels are drawn
+    GPU_RectangleFilled(render_target, destx, desty, destx+width, desty+height, SDL_Color { 0, 0, 0, 255 });
 
     int posx = center.x;
     int posy = center.y;
@@ -1029,7 +992,7 @@ void cata_tiles::draw( int destx, int desty, const tripoint &center, int width, 
         }
     }
 
-    SDL_RenderSetClipRect(renderer, NULL);
+    GPU_UnsetClip(render_target);
 }
 
 void cata_tiles::draw_rhombus(int destx, int desty, int size, SDL_Color color, int widthLimit, int heightLimit) {
@@ -1037,11 +1000,12 @@ void cata_tiles::draw_rhombus(int destx, int desty, int size, SDL_Color color, i
         for(int yOffset = -size + abs(xOffset); yOffset <= size - abs(xOffset); yOffset++) {
             if(xOffset < widthLimit && yOffset < heightLimit){
                 int divisor = 2 * (abs(yOffset) == size - abs(xOffset)) + 1;
-                SDL_SetRenderDrawColor(renderer, color.r / divisor, color.g / divisor, color.b / divisor, 255);
 
-                SDL_RenderDrawPoint(renderer,
-                     destx + xOffset,
-                     desty + yOffset);
+                SDL_Color c { (Uint8) (color.r / divisor), (Uint8) (color.g / divisor), (Uint8) (color.b / divisor), 255 };
+                GPU_Pixel(render_target,
+                          destx + xOffset,
+                          desty + yOffset,
+                          c);
             }
         }
     }
@@ -1060,11 +1024,12 @@ static tripoint convert_tripoint_to_abs_submap(const tripoint& p)
 //creates the texture that individual minimap updates are drawn to
 //later, the main texture is drawn to the display buffer
 //the surface is needed to determine the color format needed by the texture
-SDL_Texture_Ptr cata_tiles::create_minimap_cache_texture(int tile_width, int tile_height)
+GPU_Image_Ptr cata_tiles::create_minimap_cache_texture(int tile_width, int tile_height)
 {
     SDL_Surface_Ptr temp = create_tile_surface();
-    SDL_Texture_Ptr tex ( SDL_CreateTexture(renderer, temp->format->format, SDL_TEXTUREACCESS_TARGET,
-                                            tile_width, tile_height) );
+    GPU_Image_Ptr tex ( GPU_CreateImage(tile_width, tile_height, GPU_FORMAT_RGB) );
+    GPU_SetImageFilter(tex.get(), GPU_FILTER_NEAREST);
+    GPU_LoadTarget( tex.get() );
     return tex;
 }
 
@@ -1096,30 +1061,22 @@ void cata_tiles::process_minimap_cache_updates()
 {
     for( auto &mcp : minimap_cache ) {
         if( !mcp.second->update_list.empty() ) {
-            SDL_SetRenderTarget( renderer, mcp.second->minimap_tex.get() );
+            GPU_Target *target = mcp.second->minimap_tex.get()->target;
 
             //draw a default dark-colored rectangle over the texture which may have been used previously
             if( !mcp.second->ready ) {
                 mcp.second->ready = true;
-                SDL_Rect fullRect;
-                fullRect.h = SEEY * minimap_tile_size.y;
-                fullRect.w = SEEX * minimap_tile_size.x;
-                fullRect.x = 0;
-                fullRect.y = 0;
-                SDL_SetRenderDrawColor( renderer, 12, 12, 12, 255 );
-                SDL_RenderFillRect( renderer, &fullRect );
+                GPU_RectangleFilled(target, 0, 0, SEEX * minimap_tile_size.x, SEEY * minimap_tile_size.y, SDL_Color { 12, 12, 12, 255 });
             }
 
-            SDL_Rect rectangle;
-            rectangle.w = minimap_tile_size.x;
-            rectangle.h = minimap_tile_size.y;
             for( point &p : mcp.second->update_list ) {
-                rectangle.x = p.x * minimap_tile_size.x;
-                rectangle.y = p.y * minimap_tile_size.y;
                 pixel &current_pix = mcp.second->minimap_colors[p.y * SEEX + p.x];
-                SDL_Color c = current_pix.getSdlColor();
-                SDL_SetRenderDrawColor( renderer, c.r, c.g, c.b, c.a );
-                SDL_RenderFillRect( renderer, &rectangle );
+                GPU_RectangleFilled(target,
+                                    p.x * minimap_tile_size.x,
+                                    p.y * minimap_tile_size.y,
+                                    (p.x + 1) * minimap_tile_size.x,
+                                    (p.y + 1) * minimap_tile_size.y,
+                                    current_pix.getSdlColor());
             }
             mcp.second->update_list.clear();
         }
@@ -1286,13 +1243,11 @@ void cata_tiles::draw_minimap( int destx, int desty, const tripoint &center, int
     //update minimap textures
     process_minimap_cache_updates();
     //prepare to copy to intermediate texture
-    SDL_SetRenderTarget( renderer, main_minimap_tex.get() );
+
+    GPU_Target *target = main_minimap_tex.get()->target;
 
     //attempt to draw the submap cache if any of its tiles are exposed in the minimap area
     //the drawn flag prevents it from being drawn more than once
-    SDL_Rect drawrect;
-    drawrect.w = SEEX * minimap_tile_size.x;
-    drawrect.h = SEEY * minimap_tile_size.y;
     for( int y = 0; y < minimap_tiles_limit.y; y++ ) {
         if( start_y + y < minimap_min.y || start_y + y >= minimap_max.y ) {
             continue;
@@ -1317,15 +1272,13 @@ void cata_tiles::draw_minimap( int destx, int desty, const tripoint &center, int
             //the position of the submap texture has to account for the actual (current) 12x12 tile size
             //the clipping rectangle handles the portions that need to hide
             tripoint drawpoint( ( p.x / SEEX ) * SEEX - start_x, ( p.y / SEEY ) * SEEY - start_y, p.z );
-            drawrect.x = drawpoint.x * minimap_tile_size.x;
-            drawrect.y = drawpoint.y * minimap_tile_size.y;
-            SDL_RenderCopy( renderer, it->second->minimap_tex.get(), NULL, &drawrect );
+            GPU_Blit(it->second->minimap_tex.get(), NULL,
+                     target, drawpoint.x * minimap_tile_size.x, drawpoint.y * minimap_tile_size.y);
         }
     }
-    //set display buffer to main screen
-    set_displaybuffer_rendertarget();
+
     //paint intermediate texture to screen
-    SDL_RenderCopy( renderer, main_minimap_tex.get(), NULL, &minimap_clip_rect );
+    GPU_Blit(main_minimap_tex.get(), NULL, render_target, minimap_clip_rect.x, minimap_clip_rect.y);
 
     //unused submap caches get deleted
     clear_unused_minimap_cache();
@@ -1396,7 +1349,7 @@ void cata_tiles::draw_minimap( int destx, int desty, const tripoint &center, int
 void cata_tiles::clear_buffer()
 {
     //TODO convert this to use sdltiles ClearScreen() function
-    SDL_RenderClear(renderer);
+    GPU_Clear(render_target);
 }
 
 void cata_tiles::get_window_tile_counts(const int width, const int height, int &columns, int &rows) const
@@ -1719,7 +1672,6 @@ bool cata_tiles::draw_sprite_at( const tile_type &tile, const weighted_int_list<
     }
     auto &spritelist = *picked;
 
-    int ret = 0;
     // blit foreground based on rotation
     int rotate_sprite, sprite_num;
     if( spritelist.empty() ) {
@@ -1742,66 +1694,37 @@ bool cata_tiles::draw_sprite_at( const tile_type &tile, const weighted_int_list<
             sprite_num = rota % spritelist.size();
         }
 
-        SDL_Texture *sprite_tex = tile_values[spritelist[sprite_num]].get();
+        auto &sprite = tile_bounds[spritelist[sprite_num]];
+        GPU_Image *atlas;
 
         //use night vision colors when in use
         //then use low light tile if available
-        if(apply_night_vision_goggles && spritelist[sprite_num] < static_cast<int>(night_tile_values.size())){
+        if(apply_night_vision_goggles) {
             if(ll != LL_LOW){
                 //overexposed tile count should be the same size as night_tile_values.size
-                sprite_tex = overexposed_tile_values[spritelist[sprite_num]].get();
+                atlas = sprite.overexposed;
             } else {
-                sprite_tex = night_tile_values[spritelist[sprite_num]].get();
+                atlas = sprite.nightvision;
             }
         }
-        else if(ll == LL_LOW && spritelist[sprite_num] < static_cast<int>(shadow_tile_values.size())) {
-            sprite_tex = shadow_tile_values[spritelist[sprite_num]].get();
+        else if(ll == LL_LOW) {
+            atlas = sprite.shadow;
+        } else {
+            atlas = sprite.normal;
         }
 
-        Uint32 format;
-        int access, width, height;
-        SDL_QueryTexture(sprite_tex, &format, &access, &width, &height);
+        int width = sprite.bounds.w, height = sprite.bounds.h;
 
-        SDL_Rect destination;
-        destination.x = x + tile.offset.x * tile_width / default_tile_width;
-        destination.y = y + ( tile.offset.y - height_3d ) * tile_width / default_tile_width;
-        destination.w = width * tile_width / default_tile_width;
-        destination.h = height * tile_height / default_tile_height;
+        float dx = x + tile.offset.x * (float)tile_width / default_tile_width + (float)tile_width / 2;
+        float dy = y + ( tile.offset.y - height_3d ) * (float)tile_width / default_tile_width + (float)tile_width / 2;
+        float scale = (float)tile_width / default_tile_width;
+        float rotation = rotate_sprite ? rota * -90 : 0;
+        GPU_BlitTransformX( atlas, &sprite.bounds, render_target,
+                            dx, dy,
+                            width / 2.0, height / 2.0,
+                            rotation,
+                            scale, scale );
 
-        if ( rotate_sprite ) {
-            switch ( rota ) {
-                default:
-                case 0: // unrotated (and 180, with just two sprites)
-                    ret = SDL_RenderCopyEx( renderer, sprite_tex, NULL, &destination,
-                        0, NULL, SDL_FLIP_NONE );
-                    break;
-                case 1: // 90 degrees (and 270, with just two sprites)
-#if (defined _WIN32 || defined WINDOWS)
-                    destination.y -= 1;
-#endif
-                    ret = SDL_RenderCopyEx( renderer, sprite_tex, NULL, &destination,
-                        -90, NULL, SDL_FLIP_NONE );
-                    break;
-                case 2: // 180 degrees, implemented with flips instead of rotation
-                    ret = SDL_RenderCopyEx( renderer, sprite_tex, NULL, &destination,
-                        0, NULL, static_cast<SDL_RendererFlip>( SDL_FLIP_HORIZONTAL | SDL_FLIP_VERTICAL ) );
-                    break;
-                case 3: // 270 degrees
-#if (defined _WIN32 || defined WINDOWS)
-                    destination.x -= 1;
-#endif
-                    ret = SDL_RenderCopyEx( renderer, sprite_tex, NULL, &destination,
-                        90, NULL, SDL_FLIP_NONE );
-                    break;
-            }
-        } else { // don't rotate, same as case 0 above
-            ret = SDL_RenderCopyEx( renderer, sprite_tex, NULL, &destination,
-                0, NULL, SDL_FLIP_NONE );
-        }
-
-        if( ret != 0 ) {
-            dbg( D_ERROR ) << "SDL_RenderCopyEx() failed: " << SDL_GetError();
-        }
         // this reference passes all the way back up the call chain back to
         // cata_tiles::draw() std::vector<tile_render_info> draw_points[].height_3d
         // where we are accumulating the height of every sprite stacked up in a tile
@@ -1881,7 +1804,7 @@ bool cata_tiles::draw_terrain_below( const tripoint &p, lit_level /*ll*/, int &/
         tercol = cursesColorToSDL( curr_ter.color() );
     }
 
-    SDL_Rect belowRect;
+    GPU_Rect belowRect;
     belowRect.h = tile_width / sizefactor;
     belowRect.w = tile_height / sizefactor;
     if( tile_iso && use_tiles ) {
@@ -1907,8 +1830,8 @@ bool cata_tiles::draw_terrain_below( const tripoint &p, lit_level /*ll*/, int &/
     if( tile_iso && use_tiles ) {
         belowRect.y += tile_height / 8;
     }
-    SDL_SetRenderDrawColor( renderer, tercol.r, tercol.g, tercol.b, 255 );
-    SDL_RenderFillRect( renderer, &belowRect );
+
+    GPU_RectangleFilled2( render_target, belowRect, tercol );
 
     return true;
 }
@@ -2238,21 +2161,26 @@ void cata_tiles::create_default_item_highlight()
     const Uint8 highlight_alpha = 127;
 
     std::string key = ITEM_HIGHLIGHT;
-    int index = tile_values.size();
+    int index = tile_bounds.size();
 
     SDL_Surface_Ptr surface = create_tile_surface();
     if( !surface ) {
         return;
     }
     SDL_FillRect(surface.get(), NULL, SDL_MapRGBA(surface->format, 0, 0, 127, highlight_alpha));
-    SDL_Texture_Ptr texture( SDL_CreateTextureFromSurface( renderer, surface.get() ) );
+    GPU_Image_Ptr texture( GPU_CopyImageFromSurface( surface.get() ) );
     if( !texture ) {
         dbg( D_ERROR ) << "Failed to create texture: " << SDL_GetError();
     }
 
     if( texture ) {
-        tile_values.push_back( std::move( texture ) );
+        tile_bound bound;
+        bound.normal = bound.nightvision = bound.shadow = bound.overexposed = texture.get();
+        bound.bounds = GPU_Rect { 0, 0, (float)texture->w, (float)texture->h };
+        tile_bounds.push_back( bound );
         tile_ids[key].fg.add(std::vector<int>({index}),1);
+
+        tile_atlases.push_back(std::move(texture));
     }
 }
 

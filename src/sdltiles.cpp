@@ -53,6 +53,8 @@
 #   include "sounds.h"
 #endif
 
+#include <SDL_gpu.h>
+
 #define dbg(x) DebugLog((DebugLevel)(x),D_SDL) << __FILE__ << ":" << __LINE__ << ": "
 
 //***********************************
@@ -118,8 +120,8 @@ public:
      * Draw character t at (x,y) on the screen,
      * using (curses) color.
      */
-    virtual void OutputChar(std::string ch, int x, int y, unsigned char color) = 0;
-    virtual void draw_ascii_lines(unsigned char line_id, int drawx, int drawy, int FG) const;
+    virtual void OutputChar(uint32_t codepoint, int x, int y, int w, unsigned char FG, unsigned char BG) = 0;
+    virtual void draw_ascii_lines(unsigned char line_id, int drawx, int drawy, unsigned char FG, unsigned char BG) const;
     bool draw_window(WINDOW *win);
     bool draw_window(WINDOW *win, int offsetx, int offsety);
 
@@ -141,29 +143,37 @@ public:
 
     void clear();
     void load_font(std::string typeface, int fontsize);
-    virtual void OutputChar(std::string ch, int x, int y, unsigned char color);
+    virtual void OutputChar(uint32_t codepoint, int x, int y, int w, unsigned char FG, unsigned char BG) override;
+
 protected:
-    SDL_Texture *create_glyph(const std::string &ch, int color);
+    const uint32_t SOLID = 0xffffffff;
+    
+    void OutputChar(uint32_t codepoint, int x, int y, unsigned char color);
 
     TTF_Font* font;
     // Maps (character code, color) to SDL_Texture*
 
     struct key_t {
-        std::string   codepoints;
+        uint32_t codepoint;
         unsigned char color;
 
         // Operator overload required to use in std::map.
         bool operator<(key_t const &rhs) const noexcept {
-            return (color == rhs.color) ? codepoints < rhs.codepoints : color < rhs.color;
+            return (color == rhs.color) ? codepoint < rhs.codepoint : color < rhs.color;
         }
     };
 
     struct cached_t {
-        SDL_Texture* texture;
-        int          width;
+        GPU_Image*   texture;
+        GPU_Rect     bounds;
     };
 
     std::map<key_t, cached_t> glyph_cache_map;
+    
+    CachedTTFFont::cached_t create_glyph(uint32_t codepoint, unsigned char color);
+
+    GPU_Image *glyphsheet;
+    int next_x, next_y;
 };
 
 /**
@@ -177,11 +187,11 @@ public:
 
     void clear();
     void load_font(const std::string &path);
-    virtual void OutputChar(std::string ch, int x, int y, unsigned char color);
-    void OutputChar(long t, int x, int y, unsigned char color);
-    virtual void draw_ascii_lines(unsigned char line_id, int drawx, int drawy, int FG) const;
+
+    virtual void OutputChar(uint32_t codepoint, int x, int y, int w, unsigned char FG, unsigned char BG) override;
+    virtual void draw_ascii_lines(unsigned char line_id, int drawx, int drawy, unsigned char FG, unsigned char BG) const override;
 protected:
-    SDL_Texture *ascii[16];
+    GPU_Image *ascii[16];
     int tilewidth;
 };
 
@@ -191,11 +201,11 @@ static std::unique_ptr<Font> overmap_font;
 
 std::array<std::string, 16> main_color_names{ { "BLACK","RED","GREEN","BROWN","BLUE","MAGENTA",
 "CYAN","GRAY","DGRAY","LRED","LGREEN","YELLOW","LBLUE","LMAGENTA","LCYAN","WHITE" } };
+static GPU_Image* paletteTexture = NULL;
 static std::array<SDL_Color, 256> windowsPalette;
 static SDL_Window *window = NULL;
-static SDL_Renderer* renderer = NULL;
+static GPU_Target* render_target = NULL;
 static SDL_PixelFormat *format;
-static SDL_Texture *display_buffer;
 int WindowWidth;        //Width of the actual window, not the curses window
 int WindowHeight;       //Height of the actual window, not the curses window
 // input from various input sources. Each input source sets the type and
@@ -245,7 +255,7 @@ void init_interface()
 
 void ClearScreen()
 {
-    SDL_RenderClear(renderer);
+    GPU_Clear(render_target);
 }
 
 bool InitSDL()
@@ -284,23 +294,26 @@ bool InitSDL()
     return true;
 }
 
-bool SetupRenderTarget()
+//copied from gdi version and don't bother to rename it
+inline SDL_Color BGR(int b, int g, int r)
 {
-    if( SDL_SetRenderDrawBlendMode( renderer, SDL_BLENDMODE_NONE ) != 0 ) {
-        dbg( D_ERROR ) << "SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE) failed: " << SDL_GetError();
-        // Ignored for now, rendering could still work
-    }
-    display_buffer = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, WindowWidth, WindowHeight);
-    if( display_buffer == nullptr ) {
-        dbg( D_ERROR ) << "Failed to create window buffer: " << SDL_GetError();
-        return false;
-    }
-    if( SDL_SetRenderTarget( renderer, display_buffer ) != 0 ) {
-        dbg( D_ERROR ) << "Failed to select render target: " << SDL_GetError();
-        return false;
-    }
+    SDL_Color result;
+    result.b=b;    //Blue
+    result.g=g;    //Green
+    result.r=r;    //Red
+    result.a=255;
+    return result;
+}
 
-    return true;
+// translate color entry in consolecolors to SDL_Color
+inline SDL_Color ccolor( const std::string &color )
+{
+    const auto it = consolecolors.find( color );
+    if( it == consolecolors.end() ) {
+        dbg( D_ERROR ) << "requested non-existing color " << color << "\n";
+        return SDL_Color { 0, 0, 0, 0 };
+    }
+    return BGR( it->second[0], it->second[1], it->second[2] );
 }
 
 //Registers, creates, and shows the Window!!
@@ -309,7 +322,7 @@ bool WinCreate()
     std::string version = string_format("Cataclysm: Dark Days Ahead - %s", getVersionString());
 
     // Common flags used for fulscreen and for windowed
-    int window_flags = 0;
+    int window_flags = SDL_WINDOW_OPENGL;
     WindowWidth = TERMINAL_WIDTH * fontwidth;
     WindowHeight = TERMINAL_HEIGHT * fontheight;
 
@@ -367,38 +380,14 @@ bool WinCreate()
         return false;
     }
 
-    bool software_renderer = get_option<bool>( "SOFTWARE_RENDERING" );
-    if( !software_renderer ) {
-        dbg( D_INFO ) << "Attempting to initialize accelerated SDL renderer.";
 
-        renderer = SDL_CreateRenderer( window, -1, SDL_RENDERER_ACCELERATED |
-                                       SDL_RENDERER_PRESENTVSYNC | SDL_RENDERER_TARGETTEXTURE );
-        if( renderer == NULL ) {
-            dbg( D_ERROR ) << "Failed to initialize accelerated renderer, falling back to software rendering: " << SDL_GetError();
-            software_renderer = true;
-        } else if( !SetupRenderTarget() ) {
-            dbg( D_ERROR ) << "Failed to initialize display buffer under accelerated rendering, falling back to software rendering.";
-            software_renderer = true;
-            if (display_buffer != NULL) {
-                SDL_DestroyTexture(display_buffer);
-                display_buffer = NULL;
-            }
-            if( renderer != NULL ) {
-                SDL_DestroyRenderer( renderer );
-                renderer = NULL;
-            }
-        }
-    }
-    if( software_renderer ) {
-        renderer = SDL_CreateRenderer( window, -1, SDL_RENDERER_SOFTWARE | SDL_RENDERER_TARGETTEXTURE );
-        if( renderer == NULL ) {
-            dbg( D_ERROR ) << "Failed to initialize software renderer: " << SDL_GetError();
-            return false;
-        } else if( !SetupRenderTarget() ) {
-            dbg( D_ERROR ) << "Failed to initialize display buffer under software rendering, unable to continue.";
-            return false;
-        }
-    }
+    GPU_SetDebugLevel(GPU_DEBUG_LEVEL_3);
+    GPU_SetInitWindow( SDL_GetWindowID( window ) );
+    render_target = GPU_Init( WindowWidth,
+                              WindowHeight,
+                              window_flags );    
+    GPU_SetShapeBlendMode( GPU_BLEND_NORMAL );
+    GPU_SetDefaultAnchor( 0.0, 0.0 );
 
     ClearScreen();
 
@@ -473,131 +462,151 @@ void WinDestroy()
     if(format)
         SDL_FreeFormat(format);
     format = NULL;
-    if (display_buffer != NULL) {
-        SDL_DestroyTexture(display_buffer);
-        display_buffer = NULL;
+
+    if (paletteTexture != NULL) {
+        GPU_FreeImage(paletteTexture);
+        paletteTexture = NULL;
     }
-    if( renderer != NULL ) {
-        SDL_DestroyRenderer( renderer );
-        renderer = NULL;
+    
+    if (render_target != NULL) {
+        GPU_Quit();
+        render_target = NULL;
     }
+
     if(window)
         SDL_DestroyWindow(window);
     window = NULL;
 }
 
-inline void FillRectDIB(SDL_Rect &rect, unsigned char color) {
-    if( SDL_SetRenderDrawColor( renderer, windowsPalette[color].r, windowsPalette[color].g,
-                                windowsPalette[color].b, 255 ) != 0 ) {
-        dbg(D_ERROR) << "SDL_SetRenderDrawColor failed: " << SDL_GetError();
-    }
-    if( SDL_RenderFillRect( renderer, &rect ) != 0 ) {
-        dbg(D_ERROR) << "SDL_RenderFillRect failed: " << SDL_GetError();
-    }
+inline void FillRectDIB(GPU_Rect &rect, unsigned char color) {
+    GPU_Rect source { (float)color, 0, 1, 1 };
+    GPU_BlitRect(paletteTexture, &source, render_target, &rect);
 }
 
 //The following 3 methods use mem functions for fast drawing
 inline void VertLineDIB(int x, int y, int y2, int thickness, unsigned char color)
 {
-    SDL_Rect rect;
-    rect.x = x;
-    rect.y = y;
-    rect.w = thickness;
-    rect.h = y2-y;
-    FillRectDIB(rect, color);
+    GPU_Rect source { (float)color, 0, 1, 1 };
+    GPU_Rect dest { (float)x, (float)y, (float)thickness, (float)(y2-y) };
+    GPU_BlitRect(paletteTexture, &source, render_target, &dest);
 }
 inline void HorzLineDIB(int x, int y, int x2, int thickness, unsigned char color)
 {
-    SDL_Rect rect;
-    rect.x = x;
-    rect.y = y;
-    rect.w = x2-x;
-    rect.h = thickness;
-    FillRectDIB(rect, color);
+    GPU_Rect source { (float)color, 0, 1, 1 };
+    GPU_Rect dest { (float)x, (float)y, (float)(x2-x), (float)thickness };
+    GPU_BlitRect(paletteTexture, &source, render_target, &dest);
 }
 inline void FillRectDIB(int x, int y, int width, int height, unsigned char color)
 {
-    SDL_Rect rect;
-    rect.x = x;
-    rect.y = y;
-    rect.w = width;
-    rect.h = height;
-    FillRectDIB(rect, color);
+    GPU_Rect source { (float)color, 0, 1, 1 };
+    GPU_Rect dest { (float)x, (float)y, (float)width, (float)height };
+    GPU_BlitRect(paletteTexture, &source, render_target, &dest);
 }
 
 
-SDL_Texture *CachedTTFFont::create_glyph(const std::string &ch, int color)
+CachedTTFFont::cached_t CachedTTFFont::create_glyph(uint32_t const codepoint, unsigned char const color)
 {
-    SDL_Surface * sglyph = (fontblending ? TTF_RenderUTF8_Blended : TTF_RenderUTF8_Solid)(font, ch.c_str(), windowsPalette[color]);
-    if (sglyph == NULL) {
-        dbg( D_ERROR ) << "Failed to create glyph for " << ch << ": " << TTF_GetError();
-        return NULL;
+    cached_t glyph { nullptr, { 0, 0, 0, 0 } };
+
+    SDL_Surface * sglyph;
+    if (codepoint == SOLID) {
+        Uint32 Rmask, Gmask, Bmask, Amask;
+        int bpp;
+
+        SDL_PixelFormatEnumToMasks(SDL_PIXELFORMAT_RGBA8888, &bpp, &Rmask, &Gmask, &Bmask, &Amask);        
+        sglyph = SDL_CreateRGBSurface(0, fontwidth, fontheight,
+                                      bpp, Rmask, Gmask, Bmask, Amask);
+        if (sglyph == NULL) {
+            dbg( D_ERROR ) << "Failed to create solid pseudoglyph surface";
+            return glyph;
+        }
+        SDL_FillRect(sglyph, NULL, SDL_MapRGBA(sglyph->format, windowsPalette[color].r, windowsPalette[color].g, windowsPalette[color].b, 255));
+
+        glyph.bounds.w = fontwidth;
+        glyph.bounds.h = fontheight;                                              
+    } else {
+        std::string ch = utf32_to_utf8( codepoint );
+        sglyph = (fontblending ? TTF_RenderUTF8_Blended : TTF_RenderUTF8_Solid)(font, ch.c_str(), windowsPalette[color]);
+        if (sglyph == NULL) {
+            dbg( D_ERROR ) << "Failed to create glyph for " << ch << ": " << TTF_GetError();
+            return glyph;
+        }
+
+        glyph.bounds.w = fontwidth * mk_wcwidth( codepoint );
+        glyph.bounds.h = fontheight;
     }
-    /* SDL interprets each pixel as a 32-bit number, so our masks must depend
-       on the endianness (byte order) of the machine */
-#if SDL_BYTEORDER == SDL_BIG_ENDIAN
-    static const Uint32 rmask = 0xff000000;
-    static const Uint32 gmask = 0x00ff0000;
-    static const Uint32 bmask = 0x0000ff00;
-    static const Uint32 amask = 0x000000ff;
-#else
-    static const Uint32 rmask = 0x000000ff;
-    static const Uint32 gmask = 0x0000ff00;
-    static const Uint32 bmask = 0x00ff0000;
-    static const Uint32 amask = 0xff000000;
-#endif
-    const int wf = utf8_wrapper( ch ).display_width();
-    // Note: bits per pixel must be 8 to be synchron with the surface
-    // that TTF_RenderGlyph above returns. This is important for SDL_BlitScaled
-    SDL_Surface *surface = SDL_CreateRGBSurface(0, fontwidth * wf, fontheight, 32,
-                                                rmask, gmask, bmask, amask);
-    if (surface == NULL) {
-        dbg( D_ERROR ) << "CreateRGBSurface failed: " << SDL_GetError();
-        SDL_Texture *glyph = SDL_CreateTextureFromSurface(renderer, sglyph);
-        SDL_FreeSurface(sglyph);
-        return glyph;
+
+    if (!glyphsheet) {
+        glyphsheet = GPU_CreateImage(fontwidth * 50, fontheight * 50, GPU_FORMAT_RGBA);
+        fprintf(stderr, "glyphsheet: %p\n", glyphsheet);
+        next_x = 0;
+        next_y = 0;
     }
-    SDL_Rect src_rect = { 0, 0, sglyph->w, sglyph->h };
-    SDL_Rect dst_rect = { 0, 0, fontwidth * wf, fontheight };
+        
+    if (glyphsheet && next_x + glyph.bounds.w > glyphsheet->w) {
+        next_x = 0;
+        next_y += glyph.bounds.h;
+    }
+    
+    if (!glyphsheet || next_y + glyph.bounds.h > glyphsheet->h) {
+        dbg( D_ERROR ) << "Out of glyphsheet space";
+        glyph.texture = GPU_CreateImage( glyph.bounds.w, fontheight, GPU_FORMAT_RGBA );
+        if (!glyph.texture) {
+            dbg( D_ERROR ) << "GPU_CreateImage failed";
+            SDL_FreeSurface(sglyph);
+            return glyph;
+        }
+        glyph.bounds.x = 0;
+        glyph.bounds.y = 0;
+    } else {
+        glyph.texture = glyphsheet;
+        glyph.bounds.x = next_x;
+        glyph.bounds.y = next_y;
+        next_x += glyph.bounds.w;
+    }
+    
+
+    GPU_Rect src_rect = { 0, 0, (float)sglyph->w, (float)sglyph->h };
+    GPU_Rect dst_rect = glyph.bounds;
     if (src_rect.w < dst_rect.w) {
-        dst_rect.x = (dst_rect.w - src_rect.w) / 2;
+        dst_rect.x += (dst_rect.w - src_rect.w) / 2;
         dst_rect.w = src_rect.w;
     } else if (src_rect.w > dst_rect.w) {
-        src_rect.x = (src_rect.w - dst_rect.w) / 2;
+        src_rect.x += (src_rect.w - dst_rect.w) / 2;
         src_rect.w = dst_rect.w;
     }
     if (src_rect.h < dst_rect.h) {
-        dst_rect.y = (dst_rect.h - src_rect.h) / 2;
+        dst_rect.y += (dst_rect.h - src_rect.h) / 2;
         dst_rect.h = src_rect.h;
     } else if (src_rect.h > dst_rect.h) {
-        src_rect.y = (src_rect.h - dst_rect.h) / 2;
+        src_rect.y += (src_rect.h - dst_rect.h) / 2;
         src_rect.h = dst_rect.h;
     }
 
-    if (SDL_BlitSurface(sglyph, &src_rect, surface, &dst_rect) != 0) {
-        dbg( D_ERROR ) << "SDL_BlitSurface failed: " << SDL_GetError();
-        SDL_FreeSurface(surface);
-    } else {
-        SDL_FreeSurface(sglyph);
-        sglyph = surface;
-    }
-
-    SDL_Texture *glyph = SDL_CreateTextureFromSurface(renderer, sglyph);
+    GPU_UpdateImage( glyph.texture, &dst_rect, sglyph, &src_rect );
     SDL_FreeSurface(sglyph);
     return glyph;
 }
 
-void CachedTTFFont::OutputChar(std::string ch, int const x, int const y, unsigned char const color)
+void CachedTTFFont::OutputChar(uint32_t const codepoint, int const x, int const y, int const w, unsigned char const FG, unsigned char const BG)
 {
-    key_t    key {std::move(ch), static_cast<unsigned char>(color & 0xf)};
+    for (int xf = 0; xf < w; ++xf) {
+        OutputChar(SOLID, x + xf, y, BG);
+    }
+
+    OutputChar(codepoint, x, y, FG);
+}
+
+void CachedTTFFont::OutputChar(uint32_t const codepoint, int const x, int const y, unsigned char const color)
+{
+    key_t    key {codepoint, static_cast<unsigned char>(color & 0xf)};
     cached_t value;
 
     auto const it = glyph_cache_map.lower_bound(key);
     if (it != std::end(glyph_cache_map) && !glyph_cache_map.key_comp()(key, it->first)) {
         value = it->second;
     } else {
-        value.texture = create_glyph(key.codepoints, key.color);
-        value.width = fontwidth * utf8_wrapper(key.codepoints).display_width();
+        value = create_glyph(key.codepoint, key.color);
         glyph_cache_map.insert(it, std::make_pair(std::move(key), value));
     }
 
@@ -605,35 +614,25 @@ void CachedTTFFont::OutputChar(std::string ch, int const x, int const y, unsigne
         // Nothing we can do here )-:
         return;
     }
-    SDL_Rect rect {x, y, value.width, fontheight};
-    if (SDL_RenderCopy( renderer, value.texture, nullptr, &rect)) {
-        dbg(D_ERROR) << "SDL_RenderCopy failed: " << SDL_GetError();
-    }
+
+    GPU_Blit( value.texture, &value.bounds, render_target, x, y );
 }
 
-void BitmapFont::OutputChar(std::string ch, int x, int y, unsigned char color)
+void BitmapFont::OutputChar(uint32_t t, int x, int y, int w, unsigned char FG, unsigned char BG)
 {
-    int len = ch.length();
-    const char *s = ch.c_str();
-    const long t = UTF8_getch(&s, &len);
-    BitmapFont::OutputChar(t, x, y, color);
-}
-
-void BitmapFont::OutputChar(long t, int x, int y, unsigned char color)
-{
+    FillRectDIB(x, y, w * fontwidth, fontheight, BG);
+    
     if( t > 256 ) {
         return;
     }
-    SDL_Rect src;
+    
+    GPU_Rect src;
     src.x = (t % tilewidth) * fontwidth;
     src.y = (t / tilewidth) * fontheight;
     src.w = fontwidth;
     src.h = fontheight;
-    SDL_Rect rect;
-    rect.x = x; rect.y = y; rect.w = fontwidth; rect.h = fontheight;
-    if( SDL_RenderCopy( renderer, ascii[color], &src, &rect ) != 0 ) {
-        dbg(D_ERROR) << "SDL_RenderCopy failed: " << SDL_GetError();
-    }
+
+    GPU_Blit( ascii[FG], &src, render_target, x, y );
 }
 
 // only update if the set interval has elapsed
@@ -641,31 +640,11 @@ void try_sdl_update()
 {
     unsigned long now = SDL_GetTicks();
     if (now - lastupdate >= interval) {
-        // Select default target (the window), copy rendered buffer
-        // there, present it, select the buffer as target again.
-        if( SDL_SetRenderTarget( renderer, NULL ) != 0 ) {
-            dbg(D_ERROR) << "SDL_SetRenderTarget failed: " << SDL_GetError();
-        }
-        SDL_RenderSetLogicalSize( renderer, WindowWidth, WindowHeight );
-        if( SDL_RenderCopy( renderer, display_buffer, NULL, NULL ) != 0 ) {
-            dbg(D_ERROR) << "SDL_RenderCopy failed: " << SDL_GetError();
-        }
-        SDL_RenderPresent(renderer);
-        if( SDL_SetRenderTarget( renderer, display_buffer ) != 0 ) {
-            dbg(D_ERROR) << "SDL_SetRenderTarget failed: " << SDL_GetError();
-        }
+        GPU_Flip( render_target );
         needupdate = false;
         lastupdate = now;
     } else {
         needupdate = true;
-    }
-}
-
-//for resetting the render target after updating texture caches in cata_tiles.cpp
-void set_displaybuffer_rendertarget()
-{
-    if( SDL_SetRenderTarget( renderer, display_buffer ) != 0 ) {
-        dbg(D_ERROR) << "SDL_SetRenderTarget failed: " << SDL_GetError();
     }
 }
 
@@ -687,8 +666,10 @@ void find_videodisplays() {
 
 // line_id is one of the LINE_*_C constants
 // FG is a curses color
-void Font::draw_ascii_lines(unsigned char line_id, int drawx, int drawy, int FG) const
+void Font::draw_ascii_lines(unsigned char line_id, int drawx, int drawy, unsigned char FG, unsigned char BG) const
 {
+    FillRectDIB(drawx, drawy, fontwidth, fontheight, BG);
+    
     switch (line_id) {
         case LINE_OXOX_C://box bottom/top side (horizontal line)
             HorzLineDIB(drawx, drawy + (fontheight / 2), drawx + fontwidth, 1, FG);
@@ -834,6 +815,11 @@ void clear_window_area(WINDOW* win)
 
 void curses_drawwindow(WINDOW *win)
 {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    const char *what;
+    
     bool update = false;
     if (g && win == g->w_terrain && use_tiles) {
         // game::w_terrain can be drawn by the tilecontext.
@@ -848,6 +834,7 @@ void curses_drawwindow(WINDOW *win)
         invalidate_framebuffer(terminal_framebuffer, win->x, win->y, TERRAIN_WINDOW_TERM_WIDTH, TERRAIN_WINDOW_TERM_HEIGHT);
 
         update = true;
+        what = "terrain (tiles)";
     } else if (g && win == g->w_terrain && map_font ) {
         // When the terrain updates, predraw a black space around its edge
         // to keep various former interface elements from showing through the gaps
@@ -869,9 +856,11 @@ void curses_drawwindow(WINDOW *win)
         }
         // Special font for the terrain window
         update = map_font->draw_window(win);
+        what = "terrain (ascii)";
     } else if (g && win == g->w_overmap && overmap_font ) {
         // Special font for the terrain window
         update = overmap_font->draw_window(win);
+        what = "overmap";
     } else if (win == w_hit_animation && map_font ) {
         // The animation window overlays the terrain window,
         // it uses the same font, but it's only 1 square in size.
@@ -879,6 +868,7 @@ void curses_drawwindow(WINDOW *win)
         int offsetx = win->x * map_font->fontwidth;
         int offsety = win->y * map_font->fontheight;
         update = map_font->draw_window(win, offsetx, offsety);
+        what = "hit_animation";
     } else if (g && win == g->w_blackspace) {
         // fill-in black space window skips draw code
         // so as not to confuse framebuffer any more than necessary
@@ -888,6 +878,7 @@ void curses_drawwindow(WINDOW *win)
         int wheight = win->height * font->fontheight;
         FillRectDIB(offsetx, offsety, wwidth, wheight, COLOR_BLACK);
         update = true;
+        what = "blackspace";
     } else if (g && win == g->w_pixel_minimap && g->pixel_minimap_option) {
         // Make sure the entire minimap window is black before drawing.
         clear_window_area(win);
@@ -896,13 +887,20 @@ void curses_drawwindow(WINDOW *win)
             tripoint( g->u.pos().x, g->u.pos().y, g->ter_view_z ),
             win->width * font->fontwidth, win->height * font->fontheight);
         update = true;
+        what = "minimap";
     } else {
         // Either not using tiles (tilecontext) or not the w_terrain window.
         update = font->draw_window(win);
+        what = "other";
     }
     if(update) {
         needupdate = true;
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    fprintf(stderr, "draw %p (%s): %.03fus\n",
+            win, what,
+            (end.tv_sec - start.tv_sec) * 1e6 + (end.tv_nsec - start.tv_nsec) * 1e-3);
 }
 
 bool Font::draw_window(WINDOW *win)
@@ -970,14 +968,20 @@ bool Font::draw_window( WINDOW *win, int offsetx, int offsety )
         }
         update = true;
         win->line[j].touched = false;
+
+        const int drawy = offsety + j * fontheight;
+        if (drawy + fontheight > WindowHeight) {
+            // Outside of the display area, would not render anyway
+            break;
+        }
+        
         for( int i = 0; i < win->width; i++ ) {
             const cursecell &cell = win->line[j].chars[i];
 
             const int drawx = offsetx + i * fontwidth;
-            const int drawy = offsety + j * fontheight;
-            if( drawx + fontwidth > WindowWidth || drawy + fontheight > WindowHeight ) {
+            if( drawx + fontwidth > WindowWidth ) {
                 // Outside of the display area, would not render anyway
-                continue;
+                break;
             }
 
             // Avoid redrawing an unchanged tile by checking the framebuffer cache
@@ -1004,19 +1008,18 @@ bool Font::draw_window( WINDOW *win, int offsetx, int offsety )
             const int FG = cell.FG;
             const int BG = cell.BG;
             if( codepoint != UNKNOWN_UNICODE ) {
-                const int cw = utf8_width( cell.ch );
+                const int cw = mk_wcwidth( codepoint );
                 if( cw < 1 ) {
                     // utf8_width() may return a negative width
                     continue;
                 }
-                FillRectDIB( drawx, drawy, fontwidth * cw, fontheight, BG );
-                OutputChar( cell.ch, drawx, drawy, FG );
+                OutputChar( codepoint, drawx, drawy, cw, FG, BG );
             } else {
-                FillRectDIB( drawx, drawy, fontwidth, fontheight, BG );
-                draw_ascii_lines( static_cast<unsigned char>( cell.ch[0] ), drawx, drawy, FG );
+                draw_ascii_lines( static_cast<unsigned char>( cell.ch[0] ), drawx, drawy, FG, BG );
             }
 
         }
+
     }
     win->draw = false; //We drew the window, mark it as so
     //Keeping track of last drawn window and tilemode zoom level
@@ -1634,7 +1637,7 @@ WINDOW *curses_init(void)
     }
 
     dbg( D_INFO ) << "Initializing SDL Tiles context";
-    tilecontext.reset(new cata_tiles(renderer));
+    tilecontext.reset(new cata_tiles(render_target));
     try {
         tilecontext->init();
         dbg( D_INFO ) << "Tiles initialized successfully.";
@@ -1716,17 +1719,6 @@ int curses_destroy(void)
     return 1;
 }
 
-//copied from gdi version and don't bother to rename it
-inline SDL_Color BGR(int b, int g, int r)
-{
-    SDL_Color result;
-    result.b=b;    //Blue
-    result.g=g;    //Green
-    result.r=r;    //Red
-    //result.a=0;//The Alpha, isnt used, so just set it to 0
-    return result;
-}
-
 void load_colors( JsonObject &jsobj )
 {
     JsonArray jsarr;
@@ -1741,17 +1733,6 @@ void load_colors( JsonObject &jsobj )
         bgr[1] = jsarr.get_int( 1 );
         bgr[2] = jsarr.get_int( 0 );
     }
-}
-
-// translate color entry in consolecolors to SDL_Color
-inline SDL_Color ccolor( const std::string &color )
-{
-    const auto it = consolecolors.find( color );
-    if( it == consolecolors.end() ) {
-        dbg( D_ERROR ) << "requested non-existing color " << color << "\n";
-        return SDL_Color { 0, 0, 0, 0 };
-    }
-    return BGR( it->second[0], it->second[1], it->second[2] );
 }
 
 // This function mimics the ncurses interface. It must not throw.
@@ -1776,6 +1757,16 @@ int curses_start_color( void )
     for( size_t c = 0; c < main_color_names.size(); c++ ) {
         windowsPalette[c]  = ccolor( main_color_names[c] );
     }
+
+    paletteTexture = GPU_CreateImage(256, 1, GPU_FORMAT_RGBA);
+    GPU_Target *target = GPU_LoadTarget(paletteTexture);
+    GPU_ClearRGBA(target, 0, 0, 0, 255);
+    for (size_t c = 0; c < windowsPalette.size(); ++c) {
+        GPU_Pixel(target, c, 0, windowsPalette[c]);
+    }
+    GPU_FreeTarget(target);
+    GPU_SetImageFilter(paletteTexture, GPU_FILTER_NEAREST);
+    
     return OK;
 }
 
@@ -1931,7 +1922,7 @@ void BitmapFont::clear()
 {
     for (size_t a = 0; a < 16; a++) {
         if (ascii[a] != NULL) {
-            SDL_DestroyTexture(ascii[a]);
+            GPU_FreeImage(ascii[a]);
             ascii[a] = NULL;
         }
     }
@@ -1951,12 +1942,13 @@ void BitmapFont::load_font(const std::string &typeface)
     }
     Uint32 key = SDL_MapRGB(asciiload->format, 0xFF, 0, 0xFF);
     SDL_SetColorKey(asciiload,SDL_TRUE,key);
+
     SDL_Surface *ascii_surf[16];
     ascii_surf[0] = SDL_ConvertSurface(asciiload,format,0);
     SDL_SetSurfaceRLE(ascii_surf[0], true);
-    SDL_FreeSurface(asciiload);
+            SDL_FreeSurface(asciiload);
 
-    for (size_t a = 1; a < 16; ++a) {
+    for (size_t a = 0; a < 16; ++a) {
         ascii_surf[a] = SDL_ConvertSurface(ascii_surf[0],format,0);
         SDL_SetSurfaceRLE(ascii_surf[a], true);
     }
@@ -1975,49 +1967,49 @@ void BitmapFont::load_font(const std::string &typeface)
     }
     tilewidth = ascii_surf[0]->w / fontwidth;
 
-    //convert ascii_surf to SDL_Texture
+    //convert ascii_surf to GPU_Image
     for(int a = 0; a < 16; ++a) {
-        ascii[a] = SDL_CreateTextureFromSurface(renderer,ascii_surf[a]);
+        ascii[a] = GPU_CopyImageFromSurface(ascii_surf[a]);
         SDL_FreeSurface(ascii_surf[a]);
     }
 }
 
-void BitmapFont::draw_ascii_lines(unsigned char line_id, int drawx, int drawy, int FG) const
+void BitmapFont::draw_ascii_lines(unsigned char line_id, int drawx, int drawy, unsigned char FG, unsigned char BG) const
 {
     BitmapFont *t = const_cast<BitmapFont*>(this);
     switch (line_id) {
         case LINE_OXOX_C://box bottom/top side (horizontal line)
-            t->OutputChar(0xcd, drawx, drawy, FG);
+            t->OutputChar(0xcd, drawx, drawy, 1, FG, BG);
             break;
         case LINE_XOXO_C://box left/right side (vertical line)
-            t->OutputChar(0xba, drawx, drawy, FG);
+            t->OutputChar(0xba, drawx, drawy, 1, FG, BG);
             break;
         case LINE_OXXO_C://box top left
-            t->OutputChar(0xc9, drawx, drawy, FG);
+            t->OutputChar(0xc9, drawx, drawy, 1, FG, BG);
             break;
         case LINE_OOXX_C://box top right
-            t->OutputChar(0xbb, drawx, drawy, FG);
+            t->OutputChar(0xbb, drawx, drawy, 1, FG, BG);
             break;
         case LINE_XOOX_C://box bottom right
-            t->OutputChar(0xbc, drawx, drawy, FG);
+            t->OutputChar(0xbc, drawx, drawy, 1, FG, BG);
             break;
         case LINE_XXOO_C://box bottom left
-            t->OutputChar(0xc8, drawx, drawy, FG);
+            t->OutputChar(0xc8, drawx, drawy, 1, FG, BG);
             break;
         case LINE_XXOX_C://box bottom north T (left, right, up)
-            t->OutputChar(0xca, drawx, drawy, FG);
+            t->OutputChar(0xca, drawx, drawy, 1, FG, BG);
             break;
         case LINE_XXXO_C://box bottom east T (up, right, down)
-            t->OutputChar(0xcc, drawx, drawy, FG);
+            t->OutputChar(0xcc, drawx, drawy, 1, FG, BG);
             break;
         case LINE_OXXX_C://box bottom south T (left, right, down)
-            t->OutputChar(0xcb, drawx, drawy, FG);
+            t->OutputChar(0xcb, drawx, drawy, 1, FG, BG);
             break;
         case LINE_XXXX_C://box X (left down up right)
-            t->OutputChar(0xce, drawx, drawy, FG);
+            t->OutputChar(0xce, drawx, drawy, 1, FG, BG);
             break;
         case LINE_XOXX_C://box bottom east T (left, down, up)
-            t->OutputChar(0xb9, drawx, drawy, FG);
+            t->OutputChar(0xb9, drawx, drawy, 1, FG, BG);
             break;
         default:
             break;
@@ -2030,6 +2022,9 @@ void BitmapFont::draw_ascii_lines(unsigned char line_id, int drawx, int drawy, i
 CachedTTFFont::CachedTTFFont(int w, int h)
 : Font(w, h)
 , font(NULL)
+, glyphsheet(NULL)
+, next_x(0)
+, next_y(0)
 {
 }
 
@@ -2045,11 +2040,15 @@ void CachedTTFFont::clear()
         font = NULL;
     }
     for( auto &a : glyph_cache_map ) {
-        if( a.second.texture ) {
-            SDL_DestroyTexture( a.second.texture );
+        if( a.second.texture != nullptr && a.second.texture != glyphsheet ) {
+            GPU_FreeImage( a.second.texture );
         }
     }
     glyph_cache_map.clear();
+    if (glyphsheet) {
+        GPU_FreeImage(glyphsheet);
+        glyphsheet = nullptr;
+    }
 }
 
 void CachedTTFFont::load_font(std::string typeface, int fontsize)
