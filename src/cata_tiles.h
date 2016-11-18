@@ -25,6 +25,33 @@ extern void set_displaybuffer_rendertarget();
 
 void clear_texture_pool();
 
+class Atlas
+{
+    public:
+        typedef GPU_Rect locator;
+        typedef void ( *transformer )( SDL_Color &c );
+
+        static constexpr locator null_locator = { 0, 0, 0, 0 };
+
+        Atlas();
+        ~Atlas();
+
+        void clear();
+        locator add_tile( SDL_Surface *surface, const SDL_Rect *source_rect = nullptr,
+                          transformer xform = nullptr );
+        void blit( locator &locator, GPU_Target *target, float x, float y );
+        void blitTransformX( locator &locator, GPU_Target *target, float x, float y, float pivot_x,
+                             float pivot_y, float rotation, float scale_x, float scale_y );
+
+    private:
+        bool expand_atlas();
+
+        GPU_Image *atlas;
+        int next_x, next_y;
+        int rowheight;
+        int count;
+};
+
 /** Structures */
 struct tile_type {
     // fg and bg are both a weighted list of lists of sprite IDs
@@ -478,16 +505,16 @@ class cata_tiles
         void init_light();
 
         /** Variables */
-        struct tile_bound {
-            GPU_Rect bounds;
-            GPU_Image *normal;
-            GPU_Image *overexposed;
-            GPU_Image *nightvision;
-            GPU_Image *shadow;
+        struct tile_sprite {
+            Atlas::locator normal;
+            Atlas::locator overexposed;
+            Atlas::locator nightvision;
+            Atlas::locator shadow;
         };
 
         GPU_Target *render_target;
-        std::vector<tile_bound> tile_bounds;
+        Atlas sprite_atlas;
+        std::vector<tile_sprite> tile_sprites;
         std::unordered_map<std::string, tile_type> tile_ids;
 
         int tile_height = 0, tile_width = 0, default_tile_width, default_tile_height;
@@ -541,7 +568,6 @@ class cata_tiles
         void create_default_item_highlight();
         int last_pos_x, last_pos_y;
 
-        std::vector<GPU_Image_Ptr> tile_atlases;
         /**
          * Tracks active night vision goggle status for each draw call.
          * Allows usage of night vision tilesets during sprite rendering.
@@ -551,7 +577,7 @@ class cata_tiles
         //pixel minimap cache methods
         GPU_Image_Ptr create_minimap_cache_texture( int tile_width, int tile_height );
         void process_minimap_cache_updates();
-        void update_minimap_cache( const tripoint &loc, pixel &pix );
+        void update_minimap_cache( const tripoint &loc, const pixel &pix );
         void prepare_minimap_cache_for_updates();
         void clear_unused_minimap_cache();
 

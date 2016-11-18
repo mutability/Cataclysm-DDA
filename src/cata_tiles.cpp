@@ -121,8 +121,8 @@ cata_tiles::~cata_tiles()
 void cata_tiles::clear()
 {
     // release maps
-    tile_atlases.clear();
-    tile_bounds.clear();
+    sprite_atlas.clear();
+    tile_sprites.clear();
     tile_ids.clear();
     // release minimap
     minimap_cache.clear();
@@ -252,24 +252,19 @@ static void color_pixel_red_mix(pixel& pix, int percent)
     pix.b = pix.b * otherpercent / 100;
 }
 
-static void color_pixel_grayscale(pixel& pix)
+static void color_pixel_grayscale(SDL_Color& pix)
 {
-    bool isBlack = pix.isBlack();
     int result = (pix.r + pix.b + pix.g) / 3;
     result = result * 6 / 10;
     if (result > 255) {
         result = 255;
-    }
-    //workaround for color key 0 on some tilesets
-    if (result<1 && !isBlack){
-        result = 1;
     }
     pix.r = result;
     pix.g = result;
     pix.b = result;
 }
 
-static void color_pixel_nightvision(pixel& pix)
+static void color_pixel_nightvision(SDL_Color &pix)
 {
     int result = (pix.r + pix.b + pix.g) / 3;
     result = result * 3 / 4 + 64;
@@ -281,7 +276,7 @@ static void color_pixel_nightvision(pixel& pix)
     pix.b = result / 7;
 }
 
-static void color_pixel_overexposed(pixel& pix)
+static void color_pixel_overexposed(SDL_Color& pix)
 {
     int result = (pix.r + pix.b + pix.g) / 3;
     result = result / 4 + 192;
@@ -293,69 +288,24 @@ static void color_pixel_overexposed(pixel& pix)
     pix.b = result / 7;
 }
 
-static void apply_color_filter(SDL_Surface_Ptr &surf, void (&pixel_converter)(pixel &))
-{
-    for (int y = 0; y < surf->h; y++) {
-        for (int x = 0; x < surf->w; x++) {
-            pixel pix = get_pixel_color(surf, x, y, surf->w);
-            pixel_converter(pix);
-            set_pixel_color(surf, x, y, surf->w, pix);
-        }
-    }
-}
-
 int cata_tiles::load_tileset(std::string img_path, int R, int G, int B, int sprite_width, int sprite_height)
 {
     /** reinit tile_atlas */
-    SDL_Surface_Ptr tile_atlas_surf( IMG_Load( img_path.c_str() ) );
+    SDL_Surface_Ptr tile_atlas( IMG_Load( img_path.c_str() ) );
 
-    if(!tile_atlas_surf) {
+    if(!tile_atlas) {
         throw std::runtime_error( std::string("Could not load tileset image at ") + img_path + ", error: " +
                                   IMG_GetError() );
     }
 
-    SDL_Surface_Ptr shadow_tile_atlas_surf = create_tile_surface(tile_atlas_surf->w, tile_atlas_surf->h);
-    SDL_Surface_Ptr nightvision_tile_atlas_surf = create_tile_surface(tile_atlas_surf->w, tile_atlas_surf->h);
-    SDL_Surface_Ptr overexposed_tile_atlas_surf = create_tile_surface(tile_atlas_surf->w, tile_atlas_surf->h);
-
-    if(!shadow_tile_atlas_surf || !nightvision_tile_atlas_surf || !overexposed_tile_atlas_surf) {
-        throw std::runtime_error( std::string("Unable to create alternate colored tilesets.") );
-    }
-
     if( R >= 0 && R <= 255 && G >= 0 && G <= 255 && B >= 0 && B <= 255 ) {
-        Uint32 key = SDL_MapRGB(tile_atlas_surf->format, R, G, B);
-        SDL_SetColorKey(tile_atlas_surf.get(), SDL_TRUE, key);
+        Uint32 key = SDL_MapRGB(tile_atlas->format, R, G, B);
+        SDL_SetColorKey(tile_atlas.get(), SDL_TRUE, key);
     }
-    
-    /** copy tile atlas into alternate atlas sets */
-    if( SDL_BlitSurface( tile_atlas_surf.get(), NULL, shadow_tile_atlas_surf.get(), NULL ) != 0 ) {
-        dbg( D_ERROR ) << "SDL_BlitSurface failed: " << SDL_GetError();
-    }
-    if( SDL_BlitSurface( tile_atlas_surf.get(), NULL, nightvision_tile_atlas_surf.get(), NULL ) != 0 ) {
-        dbg( D_ERROR ) << "SDL_BlitSurface failed: " << SDL_GetError();
-    }
-    if( SDL_BlitSurface( tile_atlas_surf.get(), NULL, overexposed_tile_atlas_surf.get(), NULL ) != 0 ) {
-        dbg( D_ERROR ) << "SDL_BlitSurface failed: " << SDL_GetError();
-    }
-
-    /** perform color filter conversion here */
-    apply_color_filter(shadow_tile_atlas_surf, color_pixel_grayscale);
-    apply_color_filter(nightvision_tile_atlas_surf, color_pixel_nightvision);
-    apply_color_filter(overexposed_tile_atlas_surf, color_pixel_overexposed);
-
-    GPU_Image_Ptr tile_atlas(GPU_CopyImageFromSurface(tile_atlas_surf.get()));
-    GPU_Image_Ptr shadow_tile_atlas(GPU_CopyImageFromSurface(shadow_tile_atlas_surf.get()));
-    GPU_Image_Ptr nightvision_tile_atlas(GPU_CopyImageFromSurface(nightvision_tile_atlas_surf.get()));
-    GPU_Image_Ptr overexposed_tile_atlas(GPU_CopyImageFromSurface(overexposed_tile_atlas_surf.get()));
-
-    GPU_SetImageFilter(tile_atlas.get(), GPU_FILTER_NEAREST);
-    GPU_SetImageFilter(shadow_tile_atlas.get(), GPU_FILTER_NEAREST);
-    GPU_SetImageFilter(nightvision_tile_atlas.get(), GPU_FILTER_NEAREST);
-    GPU_SetImageFilter(overexposed_tile_atlas.get(), GPU_FILTER_NEAREST);
 
     /** get dimensions of the atlas image */
-    int w = tile_atlas_surf->w;
-    int h = tile_atlas_surf->h;
+    int w = tile_atlas->w;
+    int h = tile_atlas->h;
     /** sx and sy will take care of any extraneous pixels that do not add up to a full tile */
     int sx = w / sprite_width;
     int sy = h / sprite_height;
@@ -363,31 +313,21 @@ int cata_tiles::load_tileset(std::string img_path, int R, int G, int B, int spri
     sx *= sprite_width;
     sy *= sprite_height;
 
-    /** Set up initial source and destination information. Destination is going to be unchanging */
-    GPU_Rect source_rect = {0, 0, (float)sprite_width, (float)sprite_height};
-
-    /** split the atlas into tiles using GPU_Rect structs instead of slicing the atlas into individual surfaces */
+    /** split the atlas into tiles and populate the common texture */
     int tilecount = 0;
     for( int y = 0; y < sy; y += sprite_height ) {
         for( int x = 0; x < sx; x += sprite_width ) {
-            source_rect.x = x;
-            source_rect.y = y;
+            SDL_Rect source_rect { x, y, sprite_width, sprite_height };
 
-            tile_bound bound;
-            bound.bounds = source_rect;
-            bound.normal = tile_atlas.get();
-            bound.shadow = shadow_tile_atlas.get();
-            bound.overexposed = overexposed_tile_atlas.get();
-            bound.nightvision = nightvision_tile_atlas.get();
-            tile_bounds.push_back( bound );
+            tile_sprite sprite;
+            sprite.normal = sprite_atlas.add_tile(tile_atlas.get(), &source_rect, nullptr);
+            sprite.shadow = sprite_atlas.add_tile(tile_atlas.get(), &source_rect, color_pixel_grayscale);
+            sprite.overexposed = sprite_atlas.add_tile(tile_atlas.get(), &source_rect, color_pixel_overexposed);
+            sprite.nightvision = sprite_atlas.add_tile(tile_atlas.get(), &source_rect, color_pixel_nightvision);
+            tile_sprites.push_back( sprite );
             tilecount++;
         }
     }
-
-    tile_atlases.push_back(std::move(tile_atlas));
-    tile_atlases.push_back(std::move(shadow_tile_atlas));
-    tile_atlases.push_back(std::move(overexposed_tile_atlas));
-    tile_atlases.push_back(std::move(nightvision_tile_atlas));
     
     dbg( D_INFO ) << "Tiles Created: " << tilecount;
 
@@ -1084,7 +1024,7 @@ void cata_tiles::process_minimap_cache_updates()
 }
 
 //finds the correct submap cache and applies the new minimap color blip if it doesn't match the current one
-void cata_tiles::update_minimap_cache( const tripoint &loc, pixel &pix )
+void cata_tiles::update_minimap_cache( const tripoint &loc, const pixel &pix )
 {
     tripoint current_submap_loc = convert_tripoint_to_abs_submap( loc );
     auto it = minimap_cache.find( current_submap_loc );
@@ -1224,19 +1164,18 @@ void cata_tiles::draw_minimap( int destx, int desty, const tripoint &center, int
                     color = cursesColorToSDL( terrain.color() );
                 }
             }
-            pixel pix( color );
             //color terrain according to lighting conditions
             if( nv_goggle ) {
                 if( lighting == LL_LOW ) {
-                    color_pixel_nightvision( pix );
+                    color_pixel_nightvision( color );
                 } else if( lighting != LL_DARK && lighting != LL_BLANK ) {
-                    color_pixel_overexposed( pix );
+                    color_pixel_overexposed( color );
                 }
             } else if( lighting == LL_LOW ) {
-                color_pixel_grayscale( pix );
+                color_pixel_grayscale( color );
             }
             //add an individual color update to the cache
-            update_minimap_cache( p, pix );
+            update_minimap_cache( p, pixel( color ) );
         }
     }
 
@@ -1694,36 +1633,35 @@ bool cata_tiles::draw_sprite_at( const tile_type &tile, const weighted_int_list<
             sprite_num = rota % spritelist.size();
         }
 
-        auto &sprite = tile_bounds[spritelist[sprite_num]];
-        GPU_Image *atlas;
+        auto &sprite = tile_sprites[spritelist[sprite_num]];
+        Atlas::locator loc;
 
         //use night vision colors when in use
         //then use low light tile if available
         if(apply_night_vision_goggles) {
             if(ll != LL_LOW){
                 //overexposed tile count should be the same size as night_tile_values.size
-                atlas = sprite.overexposed;
+                loc = sprite.overexposed;
             } else {
-                atlas = sprite.nightvision;
+                loc = sprite.nightvision;
             }
         }
         else if(ll == LL_LOW) {
-            atlas = sprite.shadow;
+            loc = sprite.shadow;
         } else {
-            atlas = sprite.normal;
+            loc = sprite.normal;
         }
 
-        int width = sprite.bounds.w, height = sprite.bounds.h;
-
+        int width = loc.w, height = loc.h;
         float dx = x + tile.offset.x * (float)tile_width / default_tile_width + (float)tile_width / 2;
         float dy = y + ( tile.offset.y - height_3d ) * (float)tile_width / default_tile_width + (float)tile_width / 2;
         float scale = (float)tile_width / default_tile_width;
         float rotation = rotate_sprite ? rota * -90 : 0;
-        GPU_BlitTransformX( atlas, &sprite.bounds, render_target,
-                            dx, dy,
-                            width / 2.0, height / 2.0,
-                            rotation,
-                            scale, scale );
+        sprite_atlas.blitTransformX( loc, render_target,
+                                     dx, dy,
+                                     width / 2.0, height / 2.0,
+                                     rotation,
+                                     scale, scale );
 
         // this reference passes all the way back up the call chain back to
         // cata_tiles::draw() std::vector<tile_render_info> draw_points[].height_3d
@@ -2161,27 +2099,19 @@ void cata_tiles::create_default_item_highlight()
     const Uint8 highlight_alpha = 127;
 
     std::string key = ITEM_HIGHLIGHT;
-    int index = tile_bounds.size();
+    int index = tile_sprites.size();
 
     SDL_Surface_Ptr surface = create_tile_surface();
     if( !surface ) {
         return;
     }
     SDL_FillRect(surface.get(), NULL, SDL_MapRGBA(surface->format, 0, 0, 127, highlight_alpha));
-    GPU_Image_Ptr texture( GPU_CopyImageFromSurface( surface.get() ) );
-    if( !texture ) {
-        dbg( D_ERROR ) << "Failed to create texture: " << SDL_GetError();
-    }
 
-    if( texture ) {
-        tile_bound bound;
-        bound.normal = bound.nightvision = bound.shadow = bound.overexposed = texture.get();
-        bound.bounds = GPU_Rect { 0, 0, (float)texture->w, (float)texture->h };
-        tile_bounds.push_back( bound );
-        tile_ids[key].fg.add(std::vector<int>({index}),1);
-
-        tile_atlases.push_back(std::move(texture));
-    }
+    tile_sprite sprite;
+    sprite.normal = sprite.nightvision = sprite.shadow = sprite.overexposed = sprite_atlas.add_tile(surface.get());
+    tile_sprites.push_back( sprite );
+    tile_ids[key].fg.add(std::vector<int>({index}),1);
+    
 }
 
 /* Animation Functions */

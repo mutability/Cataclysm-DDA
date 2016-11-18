@@ -109,6 +109,159 @@ std::map<std::string, music_playlist> playlists;
 std::string current_soundpack_path = "";
 #endif
 
+Atlas::Atlas()
+    : atlas(nullptr), next_x(0), next_y(0), rowheight(0), count(0)
+{}
+
+Atlas::~Atlas()
+{
+    clear();
+}
+
+void Atlas::clear()
+{
+    if (atlas) {
+        GPU_FreeImage(atlas);
+        atlas = nullptr;
+    }
+
+    next_x = next_y = rowheight = count = 0;
+}
+
+bool Atlas::expand_atlas()
+{
+    if (!atlas) {
+        // Find the widest atlas we can.        
+        for (int w = 65536; w > 16 && !atlas; w /= 2) {
+            atlas = GPU_CreateImage(w, 1024, GPU_FORMAT_RGBA);
+            auto target = GPU_LoadTarget(atlas);
+            GPU_FreeTarget(target);
+            if (!target) {
+                // Can't render to that, no good.
+                GPU_FreeImage(atlas);
+                atlas = nullptr;
+            }
+        }
+
+        if (!atlas) {
+            dbg( D_ERROR ) << "Failed to allocate initial atlas texture";
+            return false;
+        }
+
+        GPU_SetBlending(atlas, GPU_TRUE);
+        GPU_SetImageFilter(atlas, GPU_FILTER_NEAREST);
+        return true;
+    }
+    
+    auto newatlas = GPU_CreateImage(atlas->w, atlas->h * 2, GPU_FORMAT_RGBA);
+    if (!newatlas) {
+        dbg( D_ERROR ) << "Failed to expand atlas texture";
+        return false;
+    }
+
+    GPU_SetBlending(newatlas, GPU_TRUE);
+    GPU_SetImageFilter(newatlas, GPU_FILTER_NEAREST);
+
+    auto target = GPU_LoadTarget(newatlas);
+    if (!target) {
+        dbg( D_ERROR ) << "Failed to copy from old atlas when expanding atlas texture";
+        GPU_FreeImage(newatlas);
+        return false;
+    }
+            
+    GPU_Blit(atlas, NULL, target, 0, 0);
+    GPU_FreeTarget(target);
+    GPU_FreeImage(atlas);
+
+    atlas = newatlas;
+    return true;
+}    
+
+Atlas::locator Atlas::add_tile(SDL_Surface *surface, const SDL_Rect *source_rect, transformer xform)
+{
+    int w = source_rect ? source_rect->w : surface->w;
+    int h = source_rect ? source_rect->h : surface->h;
+    
+    if ( ! atlas ) {
+        if ( !expand_atlas() ) {
+            return Atlas::null_locator;
+        }
+    } else {
+        if ( next_x + w > atlas->w ) {
+            next_y += rowheight;
+            next_x = 0;
+            rowheight = 0;
+        }
+
+        if ( next_y + h > atlas->h ) {
+            if( !expand_atlas() ) {
+                return Atlas::null_locator;
+            }
+        }
+    }
+
+    rowheight = std::max( h, rowheight );
+
+    SDL_Surface *xform_surface = nullptr;
+    if (xform) {
+        xform_surface = SDL_CreateRGBSurface( 0, w, h, 32, 0xFF000000, 0x00FF0000, 0x0000FF00, 0x000000FF );
+        if (!xform_surface) {
+            return Atlas::null_locator;
+        }
+        
+        SDL_BlitSurface(surface, source_rect, xform_surface, NULL);
+        
+        for (int y = 0; y < xform_surface->h; y++) {                        
+            Uint32 *pixel = ( (Uint32 *) xform_surface->pixels ) + y * xform_surface->pitch/4;
+            for (int x = 0; x < xform_surface->w; ++x, ++pixel) {
+                SDL_Color c;
+                SDL_GetRGBA(*pixel, xform_surface->format, &c.r, &c.g, &c.b, &c.a);
+                xform(c);
+                *pixel = SDL_MapRGBA(xform_surface->format, c.r, c.g, c.b, c.a);
+            }
+        }
+
+        surface = xform_surface;
+        source_rect = nullptr;
+    }
+
+    GPU_Rect dest { (float)next_x, (float)next_y, (float)w, (float)h };
+    if (source_rect) {
+        GPU_Rect src { (float)source_rect->x, (float)source_rect->y, (float)source_rect->w, (float)source_rect->h }; 
+        GPU_UpdateImage(atlas, &dest, surface, &src);
+    } else {
+        GPU_UpdateImage(atlas, &dest, surface, NULL);
+    }
+
+    next_x += w;
+    ++count;
+
+    if (xform_surface) {
+        SDL_FreeSurface(xform_surface);
+    }
+
+    return dest;
+}
+
+void Atlas::blit(locator &locator, GPU_Target *target, float x, float y)
+{
+    if (!atlas || !locator.w) {
+        return;
+    }
+
+    GPU_Blit(atlas, &locator, target, x, y);
+}
+
+void Atlas::blitTransformX(locator &locator, GPU_Target *target, float x, float y, float pivot_x, float pivot_y, float rotation, float scale_x, float scale_y)
+{
+    if (!atlas || !locator.w) {
+        return;
+    }
+
+    GPU_BlitTransformX(atlas, &locator, target, x, y, pivot_x, pivot_y, rotation, scale_x, scale_y);
+}
+
+
 /**
  * A class that draws a single character on screen.
  */
@@ -147,6 +300,7 @@ public:
 
 protected:
     const uint32_t SOLID = 0xffffffff;
+    Atlas glyph_atlas;
     
     void OutputChar(uint32_t codepoint, int x, int y, unsigned char color);
 
@@ -163,17 +317,9 @@ protected:
         }
     };
 
-    struct cached_t {
-        GPU_Image*   texture;
-        GPU_Rect     bounds;
-    };
-
-    std::map<key_t, cached_t> glyph_cache_map;
+    std::map<key_t, Atlas::locator> glyph_cache_map;
     
-    CachedTTFFont::cached_t create_glyph(uint32_t codepoint, unsigned char color);
-
-    GPU_Image *glyphsheet;
-    int next_x, next_y;
+    Atlas::locator create_glyph(uint32_t codepoint, unsigned char color);
 };
 
 /**
@@ -504,10 +650,8 @@ inline void FillRectDIB(int x, int y, int width, int height, unsigned char color
 }
 
 
-CachedTTFFont::cached_t CachedTTFFont::create_glyph(uint32_t const codepoint, unsigned char const color)
+Atlas::locator CachedTTFFont::create_glyph(uint32_t const codepoint, unsigned char const color)
 {
-    cached_t glyph { nullptr, { 0, 0, 0, 0 } };
-
     SDL_Surface * sglyph;
     if (codepoint == SOLID) {
         Uint32 Rmask, Gmask, Bmask, Amask;
@@ -518,74 +662,31 @@ CachedTTFFont::cached_t CachedTTFFont::create_glyph(uint32_t const codepoint, un
                                       bpp, Rmask, Gmask, Bmask, Amask);
         if (sglyph == NULL) {
             dbg( D_ERROR ) << "Failed to create solid pseudoglyph surface";
-            return glyph;
+            return Atlas::null_locator;
         }
         SDL_FillRect(sglyph, NULL, SDL_MapRGBA(sglyph->format, windowsPalette[color].r, windowsPalette[color].g, windowsPalette[color].b, 255));
 
-        glyph.bounds.w = fontwidth;
-        glyph.bounds.h = fontheight;                                              
-    } else {
-        std::string ch = utf32_to_utf8( codepoint );
-        sglyph = (fontblending ? TTF_RenderUTF8_Blended : TTF_RenderUTF8_Solid)(font, ch.c_str(), windowsPalette[color]);
-        if (sglyph == NULL) {
-            dbg( D_ERROR ) << "Failed to create glyph for " << ch << ": " << TTF_GetError();
-            return glyph;
-        }
-
-        glyph.bounds.w = fontwidth * mk_wcwidth( codepoint );
-        glyph.bounds.h = fontheight;
-    }
-
-    if (!glyphsheet) {
-        glyphsheet = GPU_CreateImage(fontwidth * 50, fontheight * 50, GPU_FORMAT_RGBA);
-        fprintf(stderr, "glyphsheet: %p\n", glyphsheet);
-        next_x = 0;
-        next_y = 0;
-    }
-        
-    if (glyphsheet && next_x + glyph.bounds.w > glyphsheet->w) {
-        next_x = 0;
-        next_y += glyph.bounds.h;
+        auto loc = glyph_atlas.add_tile(sglyph);
+        SDL_FreeSurface(sglyph);
+        return loc;
     }
     
-    if (!glyphsheet || next_y + glyph.bounds.h > glyphsheet->h) {
-        dbg( D_ERROR ) << "Out of glyphsheet space";
-        glyph.texture = GPU_CreateImage( glyph.bounds.w, fontheight, GPU_FORMAT_RGBA );
-        if (!glyph.texture) {
-            dbg( D_ERROR ) << "GPU_CreateImage failed";
-            SDL_FreeSurface(sglyph);
-            return glyph;
-        }
-        glyph.bounds.x = 0;
-        glyph.bounds.y = 0;
-    } else {
-        glyph.texture = glyphsheet;
-        glyph.bounds.x = next_x;
-        glyph.bounds.y = next_y;
-        next_x += glyph.bounds.w;
-    }
-    
-
-    GPU_Rect src_rect = { 0, 0, (float)sglyph->w, (float)sglyph->h };
-    GPU_Rect dst_rect = glyph.bounds;
-    if (src_rect.w < dst_rect.w) {
-        dst_rect.x += (dst_rect.w - src_rect.w) / 2;
-        dst_rect.w = src_rect.w;
-    } else if (src_rect.w > dst_rect.w) {
-        src_rect.x += (src_rect.w - dst_rect.w) / 2;
-        src_rect.w = dst_rect.w;
-    }
-    if (src_rect.h < dst_rect.h) {
-        dst_rect.y += (dst_rect.h - src_rect.h) / 2;
-        dst_rect.h = src_rect.h;
-    } else if (src_rect.h > dst_rect.h) {
-        src_rect.y += (src_rect.h - dst_rect.h) / 2;
-        src_rect.h = dst_rect.h;
+    std::string ch = utf32_to_utf8( codepoint );
+    sglyph = (fontblending ? TTF_RenderUTF8_Blended : TTF_RenderUTF8_Solid)(font, ch.c_str(), windowsPalette[color]);
+    if (sglyph == NULL) {
+        dbg( D_ERROR ) << "Failed to create glyph for " << ch << ": " << TTF_GetError();
+        return Atlas::null_locator;
     }
 
-    GPU_UpdateImage( glyph.texture, &dst_rect, sglyph, &src_rect );
+    SDL_Rect src_rect;
+    src_rect.w = fontwidth * mk_wcwidth( codepoint );
+    src_rect.h = fontheight;
+    src_rect.x = (sglyph->w - src_rect.w) / 2;
+    src_rect.y = (sglyph->h - src_rect.h) / 2;
+
+    auto loc = glyph_atlas.add_tile(sglyph, &src_rect);
     SDL_FreeSurface(sglyph);
-    return glyph;
+    return loc;
 }
 
 void CachedTTFFont::OutputChar(uint32_t const codepoint, int const x, int const y, int const w, unsigned char const FG, unsigned char const BG)
@@ -600,22 +701,17 @@ void CachedTTFFont::OutputChar(uint32_t const codepoint, int const x, int const 
 void CachedTTFFont::OutputChar(uint32_t const codepoint, int const x, int const y, unsigned char const color)
 {
     key_t    key {codepoint, static_cast<unsigned char>(color & 0xf)};
-    cached_t value;
+    Atlas::locator loc;;
 
     auto const it = glyph_cache_map.lower_bound(key);
     if (it != std::end(glyph_cache_map) && !glyph_cache_map.key_comp()(key, it->first)) {
-        value = it->second;
+        loc = it->second;
     } else {
-        value = create_glyph(key.codepoint, key.color);
-        glyph_cache_map.insert(it, std::make_pair(std::move(key), value));
+        loc = create_glyph(key.codepoint, key.color);
+        glyph_cache_map.insert(it, std::make_pair(std::move(key), loc));
     }
 
-    if (!value.texture) {
-        // Nothing we can do here )-:
-        return;
-    }
-
-    GPU_Blit( value.texture, &value.bounds, render_target, x, y );
+    glyph_atlas.blit( loc, render_target, x, y );
 }
 
 void BitmapFont::OutputChar(uint32_t t, int x, int y, int w, unsigned char FG, unsigned char BG)
@@ -2022,9 +2118,6 @@ void BitmapFont::draw_ascii_lines(unsigned char line_id, int drawx, int drawy, u
 CachedTTFFont::CachedTTFFont(int w, int h)
 : Font(w, h)
 , font(NULL)
-, glyphsheet(NULL)
-, next_x(0)
-, next_y(0)
 {
 }
 
@@ -2039,16 +2132,8 @@ void CachedTTFFont::clear()
         TTF_CloseFont(font);
         font = NULL;
     }
-    for( auto &a : glyph_cache_map ) {
-        if( a.second.texture != nullptr && a.second.texture != glyphsheet ) {
-            GPU_FreeImage( a.second.texture );
-        }
-    }
     glyph_cache_map.clear();
-    if (glyphsheet) {
-        GPU_FreeImage(glyphsheet);
-        glyphsheet = nullptr;
-    }
+    glyph_atlas.clear();
 }
 
 void CachedTTFFont::load_font(std::string typeface, int fontsize)
