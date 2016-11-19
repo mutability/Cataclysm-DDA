@@ -475,6 +475,9 @@ ifdef TILES
 
     LDFLAGS += -lSDL2_ttf -lSDL2_image
 
+    CXXFLAGS += -I/usr/local/include/SDL
+    LDFLAGS += -L/usr/local/lib -lSDL2_gpu
+
     # We don't use SDL_main -- we have proper main()/WinMain()
     CXXFLAGS := $(filter-out -Dmain=SDL_main,$(CXXFLAGS))
     LDFLAGS := $(filter-out -lSDL2main,$(LDFLAGS))
