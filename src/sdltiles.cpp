@@ -109,6 +109,8 @@ std::map<std::string, music_playlist> playlists;
 std::string current_soundpack_path = "";
 #endif
 
+Atlas::locator Atlas::null_locator = { 0, 0, 0, 0 };
+
 Atlas::Atlas()
     : atlas(nullptr), next_x(0), next_y(0), rowheight(0), count(0)
 {}

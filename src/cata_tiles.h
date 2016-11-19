@@ -31,7 +31,7 @@ class Atlas
         typedef GPU_Rect locator;
         typedef void ( *transformer )( SDL_Color &c );
 
-        static constexpr locator null_locator = { 0, 0, 0, 0 };
+        static locator null_locator;
 
         Atlas();
         ~Atlas();
