@@ -194,6 +194,8 @@ std::array<std::string, 16> main_color_names{ { "BLACK","RED","GREEN","BROWN","B
 "CYAN","GRAY","DGRAY","LRED","LGREEN","YELLOW","LBLUE","LMAGENTA","LCYAN","WHITE" } };
 static std::array<SDL_Color, 256> windowsPalette;
 static SDL_Window *window = NULL;
+static GPU_Target* back_buffer = NULL;
+static GPU_Image* render_buffer = NULL;
 static GPU_Target* renderer = NULL;
 static SDL_PixelFormat *format;
 int WindowWidth;        //Width of the actual window, not the curses window
@@ -356,15 +358,30 @@ bool WinCreate()
     }
 
     GPU_SetInitWindow( SDL_GetWindowID( window ) );
-    renderer = GPU_Init( WindowWidth, WindowHeight, window_flags );
-    if( !renderer ) {
+    back_buffer = GPU_Init( WindowWidth, WindowHeight, window_flags );
+    if( !back_buffer ) {
         dbg( D_ERROR ) << "Failed to initialize renderer";
         report_gpu_errors( D_ERROR );
         return false;
     }
 
-    report_gpu_errors();
     GPU_SetDefaultAnchor( 0.0, 0.0 );
+
+    render_buffer = GPU_CreateImage( back_buffer->w, back_buffer->h, GPU_FORMAT_RGB );
+    renderer = GPU_LoadTarget( render_buffer );
+    if( !render_buffer || !renderer ) {
+        dbg( D_ERROR ) << "Failed to initialize render buffer";
+        report_gpu_errors( D_ERROR );
+        if( render_buffer ) {
+            GPU_FreeImage( render_buffer );
+            render_buffer = nullptr;
+        }
+        GPU_Quit();
+        back_buffer = nullptr;
+        return false;
+    }
+
+    report_gpu_errors();
 
     ClearScreen();
 
@@ -440,8 +457,16 @@ void WinDestroy()
         SDL_FreeFormat(format);
     format = NULL;
     if( renderer != NULL ) {
-        GPU_Quit();
+        GPU_FreeTarget( renderer );
         renderer = NULL;
+    }
+    if( render_buffer != NULL ) {
+        GPU_FreeImage( render_buffer );
+        render_buffer = NULL;
+    }
+    if( back_buffer != NULL ) {
+        GPU_Quit();
+        back_buffer = NULL;
     }
     if(window)
         SDL_DestroyWindow(window);
@@ -578,7 +603,9 @@ void try_sdl_update()
 {
     unsigned long now = SDL_GetTicks();
     if (now - lastupdate >= interval) {
-        GPU_Flip( renderer );
+        GPU_FlushBlitBuffer();
+        GPU_Blit( render_buffer, NULL, back_buffer, 0, 0 );
+        GPU_Flip( back_buffer );
         report_gpu_errors();
         needupdate = false;
         lastupdate = now;
