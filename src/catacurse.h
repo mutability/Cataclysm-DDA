@@ -15,6 +15,107 @@
 typedef int chtype;
 typedef unsigned short attr_t;
 
+// "count trailing zeros", number of zero bits in value starting from LSB
+// undefined for zero
+static inline size_t ctz( std::uint32_t x )
+{
+#if defined(__GNUC__) && __GNUC__ >= 4
+    return __builtin_ctz( x );
+#else
+    size_t n = 0;
+    if( !( x & 0x0000FFFF ) ) {
+        n += 16;
+        x >>= 16;
+    }
+    if( !( x & 0x000000FF ) ) {
+        n += 8;
+        x >>= 8;
+    }
+    if( !( x & 0x0000000F ) ) {
+        n += 4;
+        x >>= 4;
+    }
+    if( !( x & 0x00000003 ) ) {
+        n += 2;
+        x >>= 2;
+    }
+    if( !( x & 0x00000001 ) ) {
+        n += 1;
+    }
+    return n;
+#endif
+}
+
+template <size_t T>
+class change_bitmap
+{
+    private:
+        std::array < std::uint32_t, ( T + 1 / 32 ) > bits;
+
+    public:
+        typedef size_t index;
+
+        change_bitmap() {
+            clear();
+        }
+
+        void set( const index bit ) {
+            if( bit < 0 || bit >= T ) {
+                return;
+            }
+            bits[bit / 32] |= 1 << ( bit % 32 );
+        }
+
+        void set() {
+            bits.fill( ~0 );
+        }
+
+        void clear( const index bit ) {
+            if( bit >= T ) {
+                return;
+            }
+            bits[bit / 32] &= ~( 1 << ( bit % 32 ) );
+        }
+
+        void clear() {
+            bits.fill( 0 );
+        }
+
+        bool get( const index bit ) const {
+            if( bit >= T ) {
+                return 0;
+            }
+            return ( bits[bit / 32] & ( 1 << ( bit % 32 ) ) ) != 0;
+        }
+
+        index size() const {
+            return T;
+        }
+
+        index next_set_bit( const index bit ) const {
+            if( bit >= T ) {
+                return T;
+            }
+
+            auto first = bits[bit / 32] >> ( bit % 32 );
+            if( first ) {
+                return std::min( T, bit + ctz( first ) );
+            }
+
+            for( size_t i = bit / 32 + 1; i < bits.size(); ++i ) {
+                if( bits[i] ) {
+                    return std::min( T, i * 32 + ctz( bits[i] ) );
+                }
+            }
+
+            return T;
+        }
+
+        index first_set_bit() const {
+            return next_set_bit( 0 );
+        }
+};
+
 //a pair of colors[] indexes, foreground and background
 typedef struct {
     int FG;
@@ -36,7 +137,6 @@ struct cursecell {
 };
 
 struct curseline {
-    bool touched;
     std::vector<cursecell> chars;
 };
 
@@ -52,6 +152,8 @@ struct WINDOW {
     bool draw;//Tracks if the window text has been changed
     int cursorx;
     int cursory;
+    change_bitmap<1024> row_touched;
+    change_bitmap<1024> col_touched;
     std::vector<curseline> line;
 };
 

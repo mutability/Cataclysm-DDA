@@ -81,9 +81,11 @@ WINDOW *newwin(int nlines, int ncols, int begin_y, int begin_x)
     newwindow->cursory = 0;
     newwindow->line.resize(nlines);
 
+    newwindow->row_touched.set();
+    newwindow->col_touched.set();
+
     for (int j = 0; j < nlines; j++) {
         newwindow->line[j].chars.resize(ncols);
-        newwindow->line[j].touched = true; //Touch them all !?
     }
     return newwindow;
 }
@@ -112,8 +114,9 @@ inline int newline(WINDOW *win)
 // end of a line has been reached, also sets the touched flag.
 inline void addedchar(WINDOW *win)
 {
+    win->row_touched.set(win->cursory);
+    win->col_touched.set(win->cursorx);
     win->cursorx++;
-    win->line[win->cursory].touched = true;
     if (win->cursorx >= win->width) {
         newline(win);
     }
@@ -542,9 +545,10 @@ int werase(WINDOW *win)
         return 1;
     }
 
+    win->row_touched.set();
+    win->col_touched.set();
     for (int j = 0; j < win->height; j++) {
         win->line[j].chars.assign(win->width, cursecell());
-        win->line[j].touched = true;
     }
     win->draw = true;
     wmove(win, 0, 0);
@@ -627,9 +631,14 @@ int clearok(WINDOW *win)
         return 1;
     }
 
-    for (int i = 0; i < win->y && i < stdscr->height; i++) {
-        stdscr->line[i].touched = true;
+    for (int i = win->x; i < win->x + win->width && i < stdscr->width; i++) {
+        stdscr->col_touched.set(i);
     }
+
+    for (int i = win->y; i < win->y + win->height && i < stdscr->height; i++) {
+        stdscr->row_touched.set(i);
+    }
+
     return 1;
 }
 

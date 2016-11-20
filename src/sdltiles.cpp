@@ -934,37 +934,34 @@ bool Font::draw_window( WINDOW *win, int offsetx, int offsety )
         }
     }
 
-    bool update = false;
-    for( int j = 0; j < win->height; j++ ) {
-        if( !win->line[j].touched ) {
-            continue;
-        }
-        update = true;
-        win->line[j].touched = false;
-        for( int i = 0; i < win->width; i++ ) {
-            const cursecell &cell = win->line[j].chars[i];
+    if( fontScale != fontScaleBuffer ) {
+        oldWinCompatible = false;
+    }
 
+    bool update = false;
+    std::vector<curseline> &framebuffer = use_oversized_framebuffer ? oversized_framebuffer : terminal_framebuffer;
+
+    const size_t x_limit = std::min( win->row_touched.size(), ( size_t )std::max( 0, std::min( win->width, ( WindowWidth - offsetx + fontwidth - 1 ) / fontwidth ) ) );
+    const size_t y_limit = std::min( win->col_touched.size(), ( size_t )std::max( 0, std::min( win->height, ( WindowHeight - offsety + fontheight - 1 ) / fontheight ) ) );
+    for( auto j = win->row_touched.first_set_bit(); j < y_limit; j = win->row_touched.next_set_bit( j + 1 ) ) {
+        const int drawy = offsety + j * fontheight;
+
+        auto &framebuffer_row = framebuffer[win->y + j].chars;
+        auto &win_row = win->line[j].chars;
+
+        for( auto i = win->col_touched.first_set_bit(); i < x_limit; i = win->col_touched.next_set_bit( i + 1 ) ) {
             const int drawx = offsetx + i * fontwidth;
-            const int drawy = offsety + j * fontheight;
-            if( drawx + fontwidth > WindowWidth || drawy + fontheight > WindowHeight ) {
-                // Outside of the display area, would not render anyway
-                continue;
-            }
 
             // Avoid redrawing an unchanged tile by checking the framebuffer cache
             // TODO: handle caching when drawing normal windows over graphical tiles
-            const int fbx = win->x + i;
-            const int fby = win->y + j;
+            const cursecell &cell = win_row[i];
+            cursecell &oldcell = framebuffer_row[win->x + i];
 
-            std::vector<curseline> &framebuffer = use_oversized_framebuffer ? oversized_framebuffer :
-                                             terminal_framebuffer;
-
-            cursecell &oldcell = framebuffer[fby].chars[fbx];
-
-            if (oldWinCompatible && cell == oldcell && fontScale == fontScaleBuffer) {
+            if (oldWinCompatible && cell == oldcell) {
                 continue;
             }
             oldcell = cell;
+            update = true;
 
             if( cell.ch.empty() ) {
                 continue; // second cell of a multi-cell character
@@ -987,6 +984,8 @@ bool Font::draw_window( WINDOW *win, int offsetx, int offsety )
 
         }
     }
+    win->row_touched.clear();
+    win->col_touched.clear();
     win->draw = false; //We drew the window, mark it as so
     //Keeping track of last drawn window and tilemode zoom level
     winBuffer = win;
