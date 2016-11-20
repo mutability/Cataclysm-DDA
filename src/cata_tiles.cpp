@@ -85,6 +85,142 @@ void SDL_Surface_deleter::operator()( SDL_Surface *const ptr )
     }
 }
 
+Atlas::Atlas( GPU_FormatEnum format_)
+    : format(format_)
+{
+    clear();
+}
+
+Atlas::~Atlas()
+{
+}
+
+void Atlas::clear()
+{
+    frozen.clear();
+    current.reset( nullptr );
+    next_x = next_y = rowheight = 0;
+}
+
+GPU_Image_Ptr Atlas::make_atlas_texture( int w, int h )
+{
+    GPU_Image_Ptr newatlas ( GPU_CreateImage( w, h, format ) );    
+    if ( !newatlas ) {
+        return nullptr;
+    }
+
+    GPU_SetBlending( newatlas.get(), GPU_TRUE );
+    GPU_SetImageFilter( newatlas.get(), GPU_FILTER_NEAREST );
+        
+    auto target = GPU_LoadTarget( newatlas.get() );
+    if ( !target ) {
+        return nullptr;
+    }
+    GPU_FreeTarget( target );
+
+    return newatlas;
+}
+
+GPU_Image_Ptr Atlas::make_atlas_texture()
+{
+    for (int w = 65536; w > 0; w /= 2) {
+        GPU_Image_Ptr newatlas = make_atlas_texture( w, 1024 );
+        if ( newatlas ) {
+            return newatlas;
+        }
+    }
+
+    return nullptr;
+}
+
+bool Atlas::expand_atlas()
+{
+    if ( current ) {
+        GPU_Image_Ptr newatlas = make_atlas_texture( current->w, current->h * 2 );
+        if ( newatlas ) {
+            auto target = GPU_LoadTarget( newatlas.get() );
+            if ( target ) {
+                GPU_Blit( current.get(), NULL, target, 0, 0 );
+                GPU_FlushBlitBuffer();
+                GPU_FreeTarget( target );
+                current = std::move( newatlas );
+                return true;
+            }
+        }
+
+        // give up on the current atlas texture
+        frozen.push_back( std::move( current ) );
+    }
+
+    GPU_Image_Ptr newatlas = make_atlas_texture();
+    if ( newatlas ) {
+        current = std::move( newatlas );
+        next_x = next_y = rowheight = 0;
+        return true;
+    }
+
+    dbg( D_ERROR ) << "Failed to allocate atlas texture";
+    return false;
+}
+
+Atlas::sprite Atlas::add_sprite( SDL_Surface *surface, const SDL_Rect *source_rect )
+{
+    int x = source_rect ? source_rect->x : 0;
+    int y = source_rect ? source_rect->y : 0;
+    int w = source_rect ? source_rect->w : surface->w;
+    int h = source_rect ? source_rect->h : surface->h;
+    
+    if ( !current && !expand_atlas() ) {
+        return Atlas::sprite();
+    }
+
+    if ( next_x + w > current->w ) {
+        next_y += rowheight;
+        next_x = 0;
+        rowheight = 0;
+    }
+
+    if( next_y + h > current->h && !expand_atlas() ) {
+        return Atlas::sprite();
+    }
+
+    rowheight = std::max( h, rowheight );
+
+    GPU_Rect src { (float)x, (float)y, (float)w, (float)h };            
+    GPU_Rect dest { (float)next_x, (float)next_y, (float)w, (float)h };
+
+    // handle source rectangles that lie outside the source surface
+    GPU_Rect clip_dest = dest;
+    if( src.x < 0 ) {
+        int overhang = -src.x;
+        src.x += overhang;
+        src.w -= overhang;
+        clip_dest.x += src.x;
+        clip_dest.w -= overhang;
+    }
+    if( src.x + src.w > surface->w ) {
+        int overhang = src.x + src.w - surface->w;
+        src.w -= overhang;
+        clip_dest.w -= overhang;
+    }
+    if( src.y < 0 ) {
+        int overhang = -src.y;
+        src.y += overhang;
+        src.h -= overhang;
+        clip_dest.y += overhang;
+        clip_dest.h -= overhang;
+    }
+    if( src.y + src.h > surface->h ) {
+        int overhang = src.y + src.h - surface->h;
+        src.h -= overhang;
+        clip_dest.h -= overhang;
+    }
+    GPU_UpdateImage( current.get(), &clip_dest, surface, &src );
+
+    next_x += w;
+    return Atlas::sprite( current.get(), dest );
+}
+
 cata_tiles::cata_tiles(GPU_Target *render)
 {
     //ctor
