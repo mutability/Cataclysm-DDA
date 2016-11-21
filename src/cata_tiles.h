@@ -105,15 +105,13 @@ class Atlas
         class sprite
         {
             public:
-                sprite()
-                    : tex( nullptr ), bounds( {
-                    0, 0, 0, 0
-                } ) {
-                }
-
-                sprite( GPU_Image *tex_, const GPU_Rect &bounds_ )
-                    : tex( tex_ ), bounds( bounds_ ) {
-                }
+                sprite() : bounds( {
+                    -1, -1, 0, 0
+                } ) {}
+                sprite( float w, float h ) : bounds( {
+                    -1, -1, w, h
+                } ) {}
+                sprite( const GPU_Rect &bounds_ ) : bounds( bounds_ ) {}
 
                 int width() const {
                     return bounds.w;
@@ -122,56 +120,15 @@ class Atlas
                     return bounds.h;
                 }
 
-                /// Copy this sprite to a GPU_Target.
-                /// The given position is the top-left corner of the sprite.
-                void blit( GPU_Target *target, float x, float y ) const {
-                    if( !tex ) {
-                        return;
-                    }
-                    GPU_Blit( tex, const_cast<GPU_Rect *>( &bounds ), target, x, y );
-                }
-
-                /// Copy this sprite to a GPU_Target, modulating it with the given color
-                /// The given position is the top-left corner of the sprite.
-                void blit( GPU_Target *target, float x, float y, const SDL_Color &modulate ) const {
-                    if( !tex ) {
-                        return;
-                    }
-                    GPU_SetRGBA( tex, modulate.r, modulate.g, modulate.b, modulate.a );
-                    GPU_Blit( tex, const_cast<GPU_Rect *>( &bounds ), target, x, y );
-                    GPU_UnsetColor( tex );
-                }
-
-                /// Copy this sprite to a GPU_Target, rotating and scaling it
-                /// Either the sprite and scaling should be square, or the rotation
-                /// should be zero.
-                /// @param x left edge of the sprite, target coordinates
-                /// @param y top edge of the sprite, target coordinates
-                /// @param rotation angle to rotate by, counterclockwise degrees
-                /// @param scale_x X axis scale factor, 1.0 = no scaling
-                /// @param scale_y Y axis scale factor, 1.0 = no scaling
-                void blitScaleRotate( GPU_Target *target,
-                                      float x, float y,
-                                      float rotation,
-                                      float scale_x, float scale_y )  const {
-                    if( !tex ) {
-                        return;
-                    }
-                    GPU_BlitTransformX( tex, const_cast<GPU_Rect *>( &bounds ),
-                                        target, x + scale_x * bounds.w / 2.0, y + scale_y * bounds.h / 2.0,
-                                        bounds.w / 2.0, bounds.h / 2.0,
-                                        rotation,
-                                        scale_x, scale_y );
-                }
-
                 /// Test if this sprite is valid (is not a null sprite)
                 operator bool() const {
-                    return ( tex != nullptr );
+                    return ( bounds.x != -1 );
                 }
 
             private:
-                GPU_Image *tex;
                 GPU_Rect bounds;
+
+                friend class Atlas;
         };
 
         Atlas( GPU_FormatEnum format = GPU_FORMAT_RGBA );
@@ -186,16 +143,66 @@ class Atlas
         /// @return the new sprite, or the null sprite if allocation failed; never returns nullptr
         sprite add_sprite( SDL_Surface *surface, const SDL_Rect *source_rect = nullptr );
 
+        /// Copy this sprite to a GPU_Target.
+        /// The given position is the top-left corner of the sprite.
+        void blit( const sprite &source, GPU_Target *target, float x, float y ) {
+            if( !source ) {
+                draw_placeholder( target, x, y, source.width(), source.height() );
+                return;
+            }
+
+            GPU_Blit( tex.get(), const_cast<GPU_Rect *>( &source.bounds ), target, x, y );
+        }
+
+        /// Copy this sprite to a GPU_Target, modulating it with the given color
+        /// The given position is the top-left corner of the sprite.
+        void blit( const sprite &source, GPU_Target *target, float x, float y, const SDL_Color &modulate ) {
+            if( !source ) {
+                draw_placeholder( target, x, y, source.width(), source.height() );
+                return;
+            }
+            GPU_SetRGBA( mod_tex.get(), modulate.r, modulate.g, modulate.b, modulate.a );
+            GPU_Blit( mod_tex.get(), const_cast<GPU_Rect *>( &source.bounds ), target, x, y );
+        }
+
+        /// Copy this sprite to a GPU_Target, rotating and scaling it
+        /// Either the sprite and scaling should be square, or the rotation
+        /// should be zero.
+        /// @param x left edge of the sprite, target coordinates
+        /// @param y top edge of the sprite, target coordinates
+        /// @param rotation angle to rotate by, counterclockwise degrees
+        /// @param scale_x X axis scale factor, 1.0 = no scaling
+        /// @param scale_y Y axis scale factor, 1.0 = no scaling
+        void blitScaleRotate( const sprite &source,
+                              GPU_Target *target,
+                              float x, float y,
+                              float rotation,
+                              float scale_x, float scale_y )  const {
+            if( !source ) {
+                draw_placeholder( target, x, y, source.width() * scale_x, source.height() * scale_y );
+                return;
+            }
+            GPU_BlitTransformX( tex.get(), const_cast<GPU_Rect *>( &source.bounds ),
+                                target, x + scale_x * source.width() / 2.0, y + scale_y * source.height() / 2.0,
+                                source.width() / 2.0, source.height() / 2.0,
+                                rotation,
+                                scale_x, scale_y );
+        }
+
+        void save( const char *path );
+
     private:
-        GPU_Image_Ptr make_atlas_texture( int w, int h );
-        GPU_Image_Ptr make_atlas_texture();
-        bool expand_atlas();
+        static void draw_placeholder( GPU_Target *target, float x, float y, float w, float h );
+
+        GPU_Image_Ptr make_texture( int w, int h );
+        bool create();
+        bool expand();
 
         GPU_FormatEnum format;
-        GPU_Image_Ptr current;
+        GPU_Image_Ptr tex;
+        GPU_Image_Ptr mod_tex;
         int next_x, next_y;
         int rowheight;
-        std::vector<GPU_Image_Ptr> frozen;
 };
 
 // Cache of a single tile, used to avoid redrawing what didn't change.

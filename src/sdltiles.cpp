@@ -634,8 +634,8 @@ void CachedTTFFont::OutputChar( std::string ch, int const x, int const y, unsign
         it = glyph_cache_map.insert(it, std::make_pair(std::move(key), create_glyph( key.codepoints, windowsPalette[FG] )));
     }
 
-    backgrounds[BG].blit( renderer, x, y );
-    it->second.blit( renderer, x, y );
+    atlas.blit( backgrounds[BG], renderer, x, y );
+    atlas.blit( it->second, renderer, x, y );
 }
 
 void CachedTTFFont::draw_ascii_lines(unsigned char line_id, int x, int y, unsigned char FG, unsigned char BG)
@@ -650,8 +650,8 @@ void CachedTTFFont::draw_ascii_lines(unsigned char line_id, int x, int y, unsign
         it = line_cache_map.insert(it, std::make_pair(std::move(key), create_line( line_id, windowsPalette[FG] )));
     }
 
-    backgrounds[BG].blit( renderer, x, y );
-    it->second.blit( renderer, x, y );
+    atlas.blit( backgrounds[BG], renderer, x, y );
+    atlas.blit( it->second, renderer, x, y );
 }   
 
 void BitmapFont::OutputChar(std::string ch, int x, int y, unsigned char FG, unsigned char BG)

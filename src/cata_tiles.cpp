@@ -97,12 +97,12 @@ Atlas::~Atlas()
 
 void Atlas::clear()
 {
-    frozen.clear();
-    current.reset( nullptr );
+    mod_tex.reset( nullptr );
+    tex.reset( nullptr );
     next_x = next_y = rowheight = 0;
 }
 
-GPU_Image_Ptr Atlas::make_atlas_texture( int w, int h )
+GPU_Image_Ptr Atlas::make_texture( int w, int h )
 {
     GPU_Image_Ptr newatlas ( GPU_CreateImage( w, h, format ) );    
     if ( !newatlas ) {
@@ -110,8 +110,10 @@ GPU_Image_Ptr Atlas::make_atlas_texture( int w, int h )
     }
 
     GPU_SetBlending( newatlas.get(), GPU_TRUE );
+    GPU_SetBlendMode( newatlas.get(), GPU_BLEND_NORMAL );
     GPU_SetImageFilter( newatlas.get(), GPU_FILTER_NEAREST );
-        
+
+    // check we can blit to it
     auto target = GPU_LoadTarget( newatlas.get() );
     if ( !target ) {
         return nullptr;
@@ -121,42 +123,54 @@ GPU_Image_Ptr Atlas::make_atlas_texture( int w, int h )
     return newatlas;
 }
 
-GPU_Image_Ptr Atlas::make_atlas_texture()
+bool Atlas::create()
 {
-    for (int w = 65536; w > 0; w /= 2) {
-        GPU_Image_Ptr newatlas = make_atlas_texture( w, 1024 );
-        if ( newatlas ) {
-            return newatlas;
-        }
+    tex = std::move( make_texture( 256, 256 ) );
+    if ( !tex ) {
+        return false;
     }
 
-    return nullptr;
+    mod_tex.reset( GPU_CreateAliasImage( tex.get() ) );
+    return true;
 }
 
-bool Atlas::expand_atlas()
+bool Atlas::expand()
 {
-    if ( current ) {
-        GPU_Image_Ptr newatlas = make_atlas_texture( current->w, current->h * 2 );
-        if ( newatlas ) {
-            auto target = GPU_LoadTarget( newatlas.get() );
-            if ( target ) {
-                GPU_Blit( current.get(), NULL, target, 0, 0 );
-                GPU_FlushBlitBuffer();
-                GPU_FreeTarget( target );
-                current = std::move( newatlas );
-                return true;
-            }
-        }
-
-        // give up on the current atlas texture
-        frozen.push_back( std::move( current ) );
+    int new_w, new_h;
+    if (tex->w > tex->h) {
+        // expand down
+        new_w = tex->w;
+        new_h = tex->h * 2;
+    } else {
+        // expand right
+        new_w = tex->w * 2;
+        new_h = tex->h;
     }
 
-    GPU_Image_Ptr newatlas = make_atlas_texture();
+    GPU_Image_Ptr newatlas = make_texture( new_w, new_h );
     if ( newatlas ) {
-        current = std::move( newatlas );
-        next_x = next_y = rowheight = 0;
-        return true;
+        auto target = GPU_LoadTarget( newatlas.get() );
+        if ( target ) {
+            GPU_Blit( tex.get(), NULL, target, 0, 0 );
+            GPU_FlushBlitBuffer();
+            GPU_FreeTarget( target );
+
+            tex = std::move( newatlas );
+            mod_tex.reset( GPU_CreateAliasImage( tex.get() ) );
+
+            if( tex->w > tex->h ) {
+                // expanded right
+                next_x = tex->w / 2;
+                next_y = 0;
+            } else {
+                next_x = 0;
+                next_y = tex->h / 2;
+            }
+
+            fprintf(stderr, "%p: resized to %ux%u\n", this, tex->w, tex->h);
+            rowheight = 0;
+            return true;
+        }
     }
 
     dbg( D_ERROR ) << "Failed to allocate atlas texture";
@@ -170,18 +184,22 @@ Atlas::sprite Atlas::add_sprite( SDL_Surface *surface, const SDL_Rect *source_re
     int w = source_rect ? source_rect->w : surface->w;
     int h = source_rect ? source_rect->h : surface->h;
     
-    if ( !current && !expand_atlas() ) {
-        return Atlas::sprite();
+    if ( !tex && !create() ) {
+        return Atlas::sprite( w, h );
     }
 
-    if ( next_x + w > current->w ) {
+    if ( next_x + w > tex->w ) {
         next_y += rowheight;
-        next_x = 0;
+        if( tex->w > tex->h ) {
+            next_x = tex->w / 2;
+        } else {
+            next_x = 0;
+        }
         rowheight = 0;
     }
 
-    if( next_y + h > current->h && !expand_atlas() ) {
-        return Atlas::sprite();
+    if( next_y + h > tex->h && !expand() ) {
+        return Atlas::sprite( w, h );
     }
 
     rowheight = std::max( h, rowheight );
@@ -215,10 +233,28 @@ Atlas::sprite Atlas::add_sprite( SDL_Surface *surface, const SDL_Rect *source_re
         src.h -= overhang;
         clip_dest.h -= overhang;
     }
-    GPU_UpdateImage( current.get(), &clip_dest, surface, &src );
+    GPU_UpdateImage( tex.get(), &clip_dest, surface, &src );
 
     next_x += w;
-    return Atlas::sprite( current.get(), dest );
+    return Atlas::sprite( dest );
+}
+
+void Atlas::save( const char *path )
+{
+    GPU_SaveImage( tex.get(), path, GPU_FILE_PNG );
+}
+
+void Atlas::draw_placeholder( GPU_Target *target, float x, float y, float w, float h )
+{
+    float r2 = std::min( w, h ) / 2.1;
+    float r0 = r2 / 4.5;
+    float r1 = r0 * 1.5;
+
+    GPU_RectangleFilled( target, x, y, x + w, y + h, SDL_Color { 255, 200, 0, 255 } );
+    GPU_CircleFilled( target, x + w / 2, y + h / 2, r0, SDL_Color { 0, 0, 0, 255 } );
+    GPU_SectorFilled( target, x + w / 2, y + h / 2, r1, r2, 60, 120, SDL_Color { 0, 0, 0, 255 } );
+    GPU_SectorFilled( target, x + w / 2, y + h / 2, r1, r2, 180, 240, SDL_Color { 0, 0, 0, 255 } );
+    GPU_SectorFilled( target, x + w / 2, y + h / 2, r1, r2, 300, 360, SDL_Color { 0, 0, 0, 255 } );
 }
 
 cata_tiles::cata_tiles(GPU_Target *render)
