@@ -26,6 +26,7 @@
 #include "game.h"
 #include "lightmap.h"
 #include "rng.h"
+#include "swrender.h"
 #include <algorithm>
 
 //TODO replace these includes with filesystem.h
@@ -376,9 +377,13 @@ bool WinCreate()
         return false;
     }
 
+    GPU_SetDebugLevel(GPU_DEBUG_LEVEL_MAX);
     GPU_SetInitWindow( SDL_GetWindowID( window ) );
     GPU_SetRequiredFeatures( GPU_FEATURE_RENDER_TARGETS );
-    back_buffer = GPU_Init( WindowWidth, WindowHeight, window_flags );
+
+    //back_buffer = GPU_Init( WindowWidth, WindowHeight, window_flags );
+    GPU_RendererID software_id = register_software_renderer();
+    back_buffer = GPU_InitRendererByID( software_id, WindowWidth, WindowHeight, window_flags );
     if( !back_buffer ) {
         dbg( D_ERROR ) << "Failed to initialize renderer";
         report_gpu_errors();

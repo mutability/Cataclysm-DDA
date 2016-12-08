@@ -107,7 +107,7 @@ class Atlas
             public:
                 sprite() : bounds( {
                     -1, 0, 0, 0
-                } ) {}
+                } ), index( -1 ) {}
 
                 int width() const {
                     return bounds.w;
@@ -117,11 +117,11 @@ class Atlas
                 }
 
                 static sprite make_missing( int w = 0, int h = 0 ) {
-                    return sprite( GPU_Rect { -1, 0, ( float )w, ( float )h } );
+                    return sprite( GPU_Rect { -1, 0, ( float )w, ( float )h }, -1 );
                 }
 
                 static sprite make_transparent( int w = 0, int h = 0 ) {
-                    return sprite( GPU_Rect { -2, 0, ( float )w, ( float )h } );
+                    return sprite( GPU_Rect { -2, 0, ( float )w, ( float )h }, -1 );
                 }
 
                 /// Test if this sprite is valid (is not a missing sprite)
@@ -135,8 +135,9 @@ class Atlas
                 }
 
             private:
-                sprite( const GPU_Rect &bounds_ ) : bounds( bounds_ ) {}
+                sprite( const GPU_Rect &bounds_, int index_ ) : bounds( bounds_ ), index( index_ ) {}
                 GPU_Rect bounds;
+                int index;
 
                 friend class Atlas;
         };
@@ -165,7 +166,7 @@ class Atlas
                 return;
             }
 
-            GPU_Blit( tex.get(), const_cast<GPU_Rect *>( &source.bounds ), target, x, y );
+            GPU_Blit( tex[source.index].get(), const_cast<GPU_Rect *>( &source.bounds ), target, x, y );
         }
 
         /// Copy this sprite to a GPU_Target, rotating and scaling it
@@ -190,25 +191,25 @@ class Atlas
                 return;
             }
 
-            GPU_BlitTransformX( tex.get(), const_cast<GPU_Rect *>( &source.bounds ),
+            GPU_BlitTransformX( tex[source.index].get(), const_cast<GPU_Rect *>( &source.bounds ),
                                 target, x + scale_x * source.width() / 2.0, y + scale_y * source.height() / 2.0,
                                 source.width() / 2.0, source.height() / 2.0,
                                 rotation,
                                 scale_x, scale_y );
         }
 
-        void save( const char *path );
         void print_stats();
 
     private:
         static void draw_placeholder( GPU_Target *target, float x, float y, float w, float h );
 
         GPU_Image_Ptr make_texture( int w, int h );
-        bool create();
+        bool create( int w, int h );
         bool expand();
 
+        bool use_separate_textures;
         GPU_FormatEnum format;
-        GPU_Image_Ptr tex;
+        std::vector<GPU_Image_Ptr> tex;
         int next_x, next_y;
         int rowheight;
         unsigned sprite_count, sprite_pixels;
