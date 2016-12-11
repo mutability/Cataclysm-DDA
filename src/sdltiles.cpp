@@ -66,6 +66,7 @@ static unsigned long interval = 25;
 static bool needupdate = false;
 extern bool tile_iso;
 extern WINDOW *w_hit_animation;
+bool using_software_renderer = false;
 
 #ifdef SDL_SOUND
 /** The music we're currently playing. */
@@ -381,13 +382,23 @@ bool WinCreate()
     GPU_SetInitWindow( SDL_GetWindowID( window ) );
     GPU_SetRequiredFeatures( GPU_FEATURE_RENDER_TARGETS );
 
-    //back_buffer = GPU_Init( WindowWidth, WindowHeight, window_flags );
-    GPU_RendererID software_id = register_software_renderer();
-    back_buffer = GPU_InitRendererByID( software_id, WindowWidth, WindowHeight, window_flags );
+    if( !get_option<bool>( "SOFTWARE_RENDERING" ) ) {
+        back_buffer = GPU_Init( WindowWidth, WindowHeight, window_flags );
+        if( !back_buffer ) {
+            dbg( D_ERROR ) << "Failed to initialize accelerated renderer";
+            report_gpu_errors();
+        }
+    }
+
     if( !back_buffer ) {
-        dbg( D_ERROR ) << "Failed to initialize renderer";
-        report_gpu_errors();
-        return false;
+        GPU_RendererID software_id = register_software_renderer();
+        back_buffer = GPU_InitRendererByID( software_id, WindowWidth, WindowHeight, window_flags );
+        if( !back_buffer ) {
+            dbg( D_ERROR ) << "Failed to initialize software renderer";
+            report_gpu_errors();
+            return false;
+        }
+        using_software_renderer = true;
     }
 
     // GPU_Init tends to generate some "expected" errors,

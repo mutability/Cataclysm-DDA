@@ -21,6 +21,7 @@
 class JsonObject;
 struct visibility_variables;
 
+extern bool using_software_renderer;
 
 void clear_texture_pool();
 
