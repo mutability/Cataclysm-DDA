@@ -739,11 +739,13 @@ static void SDLCALL swrender_BlitTransformX(GPU_Renderer* renderer, GPU_Image* i
         src.h = image->h;
     }
 
-    dst.x = (int)x;
-    dst.y = (int)y;
+    dst.x = (int)(x - pivot_x * scaleX);
+    dst.y = (int)(y - pivot_y * scaleY);
     dst.w = (int)(src.w * scaleX);
     dst.h = (int)(src.h * scaleY);
 
+    // unlike SDL_gpu, SDL_render expects the center of rotation to be
+    // expressed in destination coordinates
     SDL_Point center;
     center.x = pivot_x * scaleX;
     center.y = pivot_y * scaleY;
