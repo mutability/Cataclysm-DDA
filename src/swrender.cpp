@@ -216,8 +216,17 @@ static void SDLCALL swrender_ResetRendererState(GPU_Renderer* renderer)
 
 static GPU_bool SDLCALL swrender_SetWindowResolution(GPU_Renderer* renderer, Uint16 w, Uint16 h)
 {
-    unimplemented("GPU_SetWindowResolution", renderer, w, h);
-    return GPU_FALSE;
+    auto target = renderer->current_context_target;
+    if( target->w != w || target->h != h ) {
+        SDL_SetWindowSize( SDL_GetWindowFromID( target->context->windowID ), w, h );
+
+        int ww, hh;
+        SDL_GetRendererOutputSize( SDL_RENDERER( target ), &ww, &hh );
+        target->w = (Uint16) ww;
+        target->h = (Uint16) hh;
+        target->using_virtual_resolution = GPU_FALSE;
+    }
+    return GPU_TRUE;
 }
 
 static void SDLCALL swrender_SetVirtualResolution(GPU_Renderer* renderer, GPU_Target* target, Uint16 w, Uint16 h)
