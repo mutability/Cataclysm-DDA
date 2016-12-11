@@ -21,7 +21,6 @@
 class JsonObject;
 struct visibility_variables;
 
-extern void set_displaybuffer_rendertarget();
 
 void clear_texture_pool();
 
