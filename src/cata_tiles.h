@@ -207,7 +207,6 @@ class Atlas
         bool create( int w, int h );
         bool expand();
 
-        bool use_separate_textures;
         GPU_FormatEnum format;
         std::vector<GPU_Image_Ptr> tex;
         int next_x, next_y;

@@ -88,7 +88,6 @@ void SDL_Surface_deleter::operator()( SDL_Surface *const ptr )
 Atlas::Atlas( GPU_FormatEnum format_)
     : format(format_)
 {
-    use_separate_textures = true;
     clear();
 }
 
@@ -330,7 +329,8 @@ Atlas::sprite Atlas::add_sprite( SDL_Surface *surface, const SDL_Rect *source_re
         clip_dest.h -= overhang;
     }
 
-    if ( ( use_separate_textures || tex.empty() ) && !create( w, h ) ) {
+    int square = std::max( w, h );
+    if ( ( using_software_renderer && !create( w, h ) ) || ( !using_software_renderer && tex.empty() && !create( square, square ) ) ) {
         return Atlas::sprite::make_missing( w, h );
     }
 
@@ -344,7 +344,7 @@ Atlas::sprite Atlas::add_sprite( SDL_Surface *surface, const SDL_Rect *source_re
         rowheight = 0;
     }
 
-    if( next_y + h > tex.back()->h && !expand() && !create( w, h ) ) {
+    if( next_y + h > tex.back()->h && !expand() && !create( square, square ) ) {
         return Atlas::sprite::make_missing( w, h );
     }
 
